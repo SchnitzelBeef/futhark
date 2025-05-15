@@ -9,11 +9,39 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+* GPU backends: more efficient atomic operations on 8-bit and 16-bit quantities.
+  This helps histograms on these types, as well as AD on programs that use
+  `f16`.
+
+* Improved handling of long chains of `flatten`/`unflatten`/`transpose`
+  operations.
+
+* New attributes: `#[blank]` and `#[scratch]`.
+
+* A module type `with`-refinement may now have an existentially quantified size
+  on its right-hand side.
+
+* Value specs in module types can now use section binding notation for symbolic
+  names, and in fact this is the preferred form that is also used by `futhark
+  fmt`. (#2266)
+
+* `futhark profile` now also prints proportion of total runtime for each cost centre.
+
 ### Removed
 
 ### Changed
 
 ### Fixed
+
+* Interpreter: some tricky aspects of size-lifted types (#2258).
+
+* Incorrect unused-name warning for named parameters in module types.
+
+* Size-lifted abstract types with hidden sizes could result in different sizes
+  being incorrectly treated as the same size.
+
+* It was possible to make size-lifted types appear unlifted by using parametric
+  types (#2268).
 
 ## [0.25.30]
 
