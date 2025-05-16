@@ -33,24 +33,6 @@ data NestedVName
   | WildcardName
   deriving (Show)
 
--- | General environment functions. Relies heavily on data.map
-envEmpty :: M.Map VName DepVal
-envEmpty = M.empty
-
-envSingle :: VName -> DepVal -> DepsEnv
-envSingle = M.singleton
-
-envExtend :: VName -> DepVal -> DepsEnv -> DepsEnv
-envExtend = M.insert
-
-envLookup :: VName -> DepsEnv -> EvalM DepVal
-envLookup vn env = do
-  case M.lookup vn env of
-    Just x -> pure x
-    Nothing -> failure $ "Unknown variable: " <> (show vn) 
-
-envUnion :: DepsEnv -> DepsEnv -> DepsEnv
-envUnion = M.union
 
 -- | Monad for evaluating environment
 newtype EvalM a = EvalM (DepsEnv -> Either Error a)
@@ -70,6 +52,26 @@ instance Monad EvalM where
         let EvalM y = f x'
          in y env
 
+
+-- | General environment functions. Relies heavily on module data.map
+envEmpty :: M.Map VName DepVal
+envEmpty = M.empty
+
+envSingle :: VName -> DepVal -> DepsEnv
+envSingle = M.singleton
+
+envExtend :: VName -> DepVal -> DepsEnv -> DepsEnv
+envExtend = M.insert
+
+envLookup :: VName -> DepsEnv -> EvalM DepVal
+envLookup vn env = do
+  case M.lookup vn env of
+    Just x -> pure x
+    Nothing -> failure $ "Unknown variable: " <> (show vn) 
+
+envUnion :: DepsEnv -> DepsEnv -> DepsEnv
+envUnion = M.union
+
 askEnv :: EvalM DepsEnv
 askEnv = EvalM $ \env -> Right env
 
@@ -79,6 +81,8 @@ localEnv f (EvalM m) = EvalM $ \env -> m (f env)
 failure :: String -> EvalM a
 failure s = EvalM $ \_env -> Left s
 
+-- | Merges two lists of that have the order instance.
+-- Used when combining two identifier sets which are always ordered
 merge :: Ord a => [a] -> [a] -> [a]
 merge [] [] = []
 merge xs [] = xs
@@ -97,47 +101,59 @@ instance Monoid Ids where
 idsSingle :: VName -> Ids
 idsSingle v = Ids [v]
 
+idsWithout :: VName -> Ids -> Ids
+idsWithout x (Ids xs) = Ids $ filter (/=x) xs
 
+-- | Extracting pure identifiers from DepVal
 depValDeps :: DepVal -> Deps
 depValDeps (DepVal x) = x
 depValDeps (DepTuple x) = foldMap depValDeps x
-depValDeps (DepFun _ _ body) = Ids $ freeVarsList (body)
+depValDeps (DepFun _ vn_n eb) = foldr idsWithout (Ids $ freeVarsList eb) vn_n
 
+-- | Joins two different sets of DepVals
+-- Only tuples of equal length can be joined without collapsing to pure DepVal Deps
 depValJoin :: DepVal -> DepVal -> DepVal
 depValJoin (DepTuple xs) (DepTuple ys)
   | length xs == length ys = DepTuple $ zipWith depValJoin xs ys
 depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 
+-- | Injects dependencies into expressions which is useful in conditionals
 depValInj :: Deps -> DepVal -> DepVal
 depValInj x (DepVal y) = DepVal $ x <> y
 depValInj x (DepTuple ys) = DepTuple $ map (depValInj x) ys
 depValInj x v = DepVal $ x <> depValDeps v
 
+-- | Locates free variables in the body of ProgBase
+-- OBS: Only handles the last progDecs currently
 depsFreeVarsInProgBase :: ProgBase Info VName -> DepsEnv
 depsFreeVarsInProgBase base =
-  case last $ progDecs base of -- Last progDec is main
+  case last $ progDecs base of 
     ValDec valbind -> depsFreeVarsInExpBase $ valBindBody valbind
-    _ -> envEmpty -- OBS
+    _ -> envEmpty -- Should not return envEmpty
 
+-- | Dependencies in ExpBase 
 depsFreeVarsInExpBase :: ExpBase Info VName -> DepsEnv
 depsFreeVarsInExpBase eb = M.fromList $ map (\x -> (x, DepVal $ idsSingle x)) $ freeVarsList eb
 
+-- | ExpBase to list of free variables in the form of VName's
 freeVarsList :: ExpBase Info VName -> [VName]
 freeVarsList eb = S.toList $ FV.fvVars $ freeInExp eb
 
--- Converts pattern bases to pure NestedVNames. *UNFINISHED* and potentially unnecessary  
+-- | Converts pattern bases to pure NestedVNames. *UNFINISHED* and potentially unnecessary  
 stripPatBase :: PatBase Info VName t -> NestedVName
 stripPatBase (Id vn _ _) = Name vn
 stripPatBase _ = WildcardName
 
+-- | Converts nested names to pure DepsEnv's, should be under careful revision..
 nestedNamesToSelfEnv :: NestedVName -> DepsEnv
 nestedNamesToSelfEnv (Name vn) = envSingle vn (DepVal $ idsSingle vn)
-nestedNamesToSelfEnv (Nested nvn) = foldr envUnion envEmpty (map nestedNamesToSelfEnv nvn) -- OBS
+nestedNamesToSelfEnv (Nested nvn) = foldr envUnion envEmpty (map nestedNamesToSelfEnv nvn)
 nestedNamesToSelfEnv WildcardName = envEmpty
 
+-- | Finds dependencies in program bases
+-- Currently only observes the last part of the declarations
 depsProgBase :: ProgBase Info VName -> EvalM DepVal 
-depsProgBase base = depsDecBase $ last $ progDecs base -- obs
-depsProgBase _ = failure "Unrecognized program base"
+depsProgBase base = depsDecBase $ last $ progDecs base
 
 depsDecBase :: DecBase Info VName-> EvalM DepVal
 depsDecBase (ValDec bindings) = do
@@ -147,6 +163,7 @@ depsDecBase (ValDec bindings) = do
     -- ^^ envUnion above might be dangerous (prefers env' over env in duplicates)
 depsDecBase _ = failure "Unrecognized declaration base"
 
+-- | Finds dependencies in expression bases
 depsExpBase :: ExpBase Info VName -> EvalM DepVal
 depsExpBase (Literal _ _) = pure $ DepVal mempty
 depsExpBase (IntLit _ _ _) = pure $ DepVal mempty
@@ -173,7 +190,7 @@ depsExpBase (ArrayLit eb_n _ _) = do
   pure $ foldr depValJoin (DepVal mempty) d_n
 depsExpBase (ArrayVal _ _ _) = pure $ DepVal mempty
 depsExpBase (Attr _ eb _) = depsExpBase eb -- OBS
-depsExpBase (Project name eb _ _) = do -- ???? name has to be integer?
+depsExpBase (Project name eb _ _) = do -- OBS, name has to be integer?
   d1 <- depsExpBase eb
   pure $
     case (d1, readMaybe (nameToString name) :: Maybe Int) of
@@ -185,7 +202,7 @@ depsExpBase (Assert eb1 eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
   pure $ d1 `depValJoin` d2
-depsExpBase (Constr _ eb_n _ _) = do  -- ????
+depsExpBase (Constr _ eb_n _ _) = do  -- OBS
   d_n <- mapM depsExpBase eb_n
   pure $ foldr depValJoin (DepVal mempty) d_n
 depsExpBase (Update eb1 sb eb2 _) = do
@@ -197,7 +214,7 @@ depsExpBase (RecordUpdate eb1 _ eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
   pure $ d1 `depValJoin` d2
-depsExpBase (OpSection qn _ _) = do -- ????
+depsExpBase (OpSection qn _ _) = do -- OBS
   env <- askEnv
   envLookup (qualLeaf qn) env
 depsExpBase (OpSectionLeft qn _ eb _ _ _) = do
@@ -210,7 +227,7 @@ depsExpBase (OpSectionRight qn _ eb _ _ _) = do
   d1 <- envLookup (qualLeaf qn) env
   d2 <- depsExpBase eb
   pure $ d1 `depValJoin` d2
-depsExpBase (ProjectSection _ _ _) = pure $ DepVal mempty -- ???? I don't know what this does or how to handle it
+depsExpBase (ProjectSection _ _ _) = pure $ DepVal mempty -- OBS
 depsExpBase (IndexSection sb _ _) = do
   d_n <- depsSliceBase sb
   pure $ foldr depValJoin (DepVal mempty) d_n
@@ -228,16 +245,18 @@ depsExpBase (Lambda pb_n eb _ _ _) = do
     case stripPatBase x of
       Name vn -> pure vn
       vn -> failure $ "Impossible pattern base for lambda" <> (show vn)
-      ) pb_n -- Might certainly need more cases ????
+      ) pb_n -- OBS, might certainly need more cases
   pure $ DepFun env names eb 
 depsExpBase (AppExp aeb _) = depsAppExpBase aeb
 
+-- | Finds dependencies in field bases
 depsFieldBase :: FieldBase Info VName -> EvalM DepVal
 depsFieldBase (RecordFieldExplicit _ eb _) = depsExpBase eb
 depsFieldBase (RecordFieldImplicit (L _ vn) _ _) = do
   env <- askEnv
   envLookup vn env  
 
+-- | Finds dependencies in application expression bases
 depsAppExpBase :: AppExpBase Info VName -> EvalM DepVal
 depsAppExpBase (Apply eb1 lst _) = do
   d1 <- depsExpBase eb1
@@ -256,39 +275,48 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   case stripPatBase pb of
     Name vn -> localEnv (const $ envExtend vn d1 env) $ depsExpBase eb2
     _ -> failure $ "Unknown variable: " <> (show pb)
-depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- Not quite sure what LetFun is ????
+depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
   d3 <- depsExpBase eb3
   pure $ depValDeps d1 `depValInj` (d2 `depValJoin` d3)
-depsAppExpBase (Loop vn_n (Id vn _ _) lib lfb eb  _) = do -- OBS only works for pattern bases of Id .. currently
-  d1 <- depsLoopInitBase lib
+depsAppExpBase (Loop _ (Id vn _ _) lib lfb eb  _) = do -- OBS only works for pattern bases of Id .. currently
+  d1 <- case lib of
+    (LoopInitExplicit eb') -> depsExpBase eb'
+    (LoopInitImplicit (Info eb')) -> depsExpBase eb'
   case lfb of
     For ib' eb' -> do
       d2 <- depsExpBase eb'
-      env <- askEnv
-      d3 <- loop (identName ib') d1
+      d3 <- loop (Just $ identName ib') d1
       pure $ depValDeps d2 `depValInj` d3
     ForIn (Id vn' _ _) eb' -> do -- OBS Does not cover all patterns
       d2 <- depsExpBase eb'
-      d3 <- loop vn' d1
+      d3 <- loop (Just vn') d1
       pure $ depValDeps d2 `depValInj` d3
-    While eb' -> depsExpBase eb' -- OBS wrong
-  where loop i deps = do
+    While eb' -> do
+      d2 <- depsExpBase eb'
+      d3 <- loop Nothing d1
+      pure $ depValDeps d2 `depValInj` d3
+    _ -> failure "This loop construct (ForIn with multiple variables) is not implemented yet"
+  where loop maybe_i ld = do
               env <- askEnv
-              let env' = envExtend i (DepVal mempty) $ envExtend vn deps env
+              let env' = case maybe_i of
+                          (Just i') -> envExtend i' (DepVal mempty) $ envExtend vn ld env
+                          Nothing -> envExtend vn ld env
                 in do
-                  deps' <- localEnv (const env') (depsExpBase eb)
-                  if deps == deps'
-                    then pure deps'
-                    else loop i $ deps `depValJoin` deps' 
+                  ld' <- localEnv (const env') (depsExpBase eb)
+                  if ld == ld'
+                    then pure ld'
+                    else loop maybe_i $ ld `depValJoin` ld' 
+depsAppExpBase (Loop _ _ _ _ _ _ ) = failure "This loop construct (several variables) is not implemented yet"
+-- ^^ Last case used only temporarily to disable warnings
 
 depsAppExpBase (BinOp _ _ eb1 eb2 _) = do
   d1 <- depsExpBase $ fst eb1
   d2 <- depsExpBase $ fst eb2
   pure $ d1 `depValJoin` d2
-depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- Not sure what this construct is ????
+depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- OBS, not sure what this construct is
 depsAppExpBase (Index eb sb _) = do
   d <- depsExpBase eb 
   d_n <- depsSliceBase sb
@@ -299,32 +327,19 @@ depsAppExpBase (Match eb ne_cb _) = do
   pure $ foldr depValJoin (DepVal mempty) $ map (\x -> depValInj (depValDeps x) d1) d_n
   -- OBS use of injection (might need to be removed)
 
-depsLoopInitBase :: LoopInitBase Info  VName -> EvalM DepVal
-depsLoopInitBase (LoopInitExplicit eb) = depsExpBase eb
-depsLoopInitBase (LoopInitImplicit (Info eb)) = depsExpBase eb
+-- | Finds dependencies in loop initializer bases
+-- depsLoopInitBase :: LoopInitBase Info  VName -> EvalM DepVal
+-- depsLoopInitBase (LoopInitExplicit eb) = depsExpBase eb
+-- depsLoopInitBase (LoopInitImplicit (Info eb)) = depsExpBase eb
 
--- depsLoopFormBase :: LoopFormBase f VName -> EvalM DepVal
--- depsLoopFormBase (For ib eb) = do
---   d1 <- depsIdentBase ib
---   d2 <- depsExpBase eb
---   pure $ d1 `depValJoin` d2
--- depsLoopFormBase (ForIn pb eb) = do
---   d1 <- depsPatBase pb
---   d2 <- depsExpBase eb
---   pure $ d1 `depValJoin` d2
--- depsLoopFormBase (While eb) = depsExpBase eb
-
--- depsIdentBase :: IdentBase f VName -> EvalM DepVal 
--- depsIdentBase ident = do
---   env <- askEnv
---   envLookup (identName ident) env
-
+-- | Finds dependencies in case bases
 depsCaseBase :: CaseBase Info VName -> EvalM DepVal
 depsCaseBase (CasePat pb eb _) = do 
   d1 <- depsPatBase pb
   d2 <- depsExpBase eb
   pure $ depValDeps d1 `depValInj` d2 -- OBS use of injection here (might need to be removed)
 
+-- | Finds dependencies in dimension index bases
 depsDimIndexBase :: DimIndexBase Info VName -> EvalM DepVal
 depsDimIndexBase (DimFix eb) = depsExpBase eb
 depsDimIndexBase (DimSlice maybe_eb1 maybe_eb2 maybe_eb3) = do
@@ -333,6 +348,7 @@ depsDimIndexBase (DimSlice maybe_eb1 maybe_eb2 maybe_eb3) = do
   d3 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb3
   pure $ d1 `depValJoin` d2 `depValJoin` d3
 
+-- | Finds dependencies in pattern bases
 depsPatBase :: PatBase Info VName t -> EvalM DepVal
 depsPatBase (TuplePat pb_n _) = do
   d_n <- mapM depsPatBase pb_n
@@ -353,6 +369,7 @@ depsPatBase (PatConstr _ _ pb_n _) = do
   pure $ foldr depValJoin (DepVal mempty) d_n
 depsPatBase (PatAttr _ pb _) = depsPatBase pb
 
+-- | Finds dependencies in type expressions
 depsTypeExp :: TypeExp (ExpBase Info VName) VName -> EvalM DepVal
 depsTypeExp (TEVar qn _) = do
   env <- askEnv
@@ -369,7 +386,7 @@ depsTypeExp (TEArray se te _ ) = do
    d2 <- depsTypeExp te
    pure $ d1 `depValJoin` d2
 depsTypeExp (TEUnique te _) = depsTypeExp te
-depsTypeExp (TEApply te tae _) = do -- ????
+depsTypeExp (TEApply te tae _) = do -- OBS
   d1 <- depsTypeExp te
   d2 <- depsTypeArgExp tae
   pure $ d1 `depValJoin` d2
@@ -394,20 +411,25 @@ depsTypeExp (TEDim vn_n te _) = do
   d1 <- depsTypeExp te
   pure $ foldr depValJoin d1 d_n
 
+-- | Finds dependencies in type argument expressions
 depsTypeArgExp :: TypeArgExp (ExpBase Info VName) VName -> EvalM DepVal
 depsTypeArgExp (TypeArgExpSize se) = depsSizeExp se
 depsTypeArgExp (TypeArgExpType te) = depsTypeExp te
 
+-- | Finds dependencies in size expressions
 depsSizeExp :: SizeExp (ExpBase Info VName) -> EvalM DepVal
 depsSizeExp (SizeExp eb _) = depsExpBase eb
 depsSizeExp (SizeExpAny _) = pure $ DepVal mempty
 
+-- | Finds dependencies in slice bases
 depsSliceBase :: SliceBase Info VName -> EvalM [DepVal]
 depsSliceBase = mapM depsDimIndexBase
 
+-- | Runs the interpreter given a predefined environment in a monadic context
 runDeps :: DepsEnv -> EvalM a -> Either Error a
 runDeps env (EvalM m) = m env
 
+-- | Finds dependencies of a program
 deps :: Prog -> String
 deps prog =
   case runDeps (depsFreeVarsInProgBase prog) (depsProgBase prog) of
