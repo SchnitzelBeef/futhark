@@ -25,6 +25,9 @@ data DepVal
   | DepFun DepsEnv [VName] (ExpBase Info VName)
   deriving (Eq, Show)
 
+data BoundDepVal = Depends VName DepVal
+  deriving (Show)
+
 type DepsEnv = M.Map VName DepVal
 
 data NestedVName
@@ -33,24 +36,54 @@ data NestedVName
   | WildcardName
   deriving (Show)
 
+data Free e a
+  = Pure a
+  | Free (e (Free e a))
 
--- | Monad for evaluating environment
-newtype EvalM a = EvalM (DepsEnv -> Either Error a)
+instance (Functor e) => Functor (Free e) where
+  fmap f (Pure x) = Pure $ f x
+  fmap f (Free g) = Free $ fmap (fmap f) g
 
-instance Functor EvalM where
-  fmap = liftM
-
-instance Applicative EvalM where
-  pure x = EvalM $ \_env -> Right x
+instance (Functor e) => Applicative (Free e) where
+  pure = Pure
   (<*>) = ap
 
-instance Monad EvalM where
-  EvalM x >>= f = EvalM $ \env ->
-    case x env of
-      Left err -> Left err
-      Right x' ->
-        let EvalM y = f x'
-         in y env
+instance (Functor e) => Monad (Free e) where
+  Pure x >>= f = f x
+  Free g >>= f = Free $ h <$> g
+    where
+      h x = x >>= f
+
+data EvalOp a
+  = LogOp BoundDepVal a
+  | ReadOp (DepsEnv -> a)  
+  | ErrorOp Error
+
+instance Functor EvalOp where
+  fmap f (LogOp s x) = LogOp s $ f x
+  fmap f (ReadOp k) = ReadOp $ f . k
+  fmap _ (ErrorOp e) = ErrorOp e
+
+type EvalM a = Free EvalOp a 
+
+depsLog :: BoundDepVal -> EvalM ()
+depsLog bdv = Free $ LogOp bdv $ pure ()
+
+askEnv :: EvalM DepsEnv
+askEnv = Free $ ReadOp $ \env -> pure env
+
+modifyEffects :: (Functor e, Functor h) => (e (Free e a) -> h (Free e a)) -> Free e a -> Free h a
+modifyEffects _ (Pure x) = Pure x
+modifyEffects g (Free e) = Free $ modifyEffects g <$> g e
+
+localEnv :: (DepsEnv -> DepsEnv) -> EvalM a -> EvalM a
+localEnv f = modifyEffects g
+  where
+    g (ReadOp k) = ReadOp $ k . f
+    g op = op
+
+failure :: String -> EvalM a
+failure = Free . ErrorOp
 
 
 -- | General environment functions. Relies heavily on module data.map
@@ -71,15 +104,6 @@ envLookup vn env = do
 
 envUnion :: DepsEnv -> DepsEnv -> DepsEnv
 envUnion = M.union
-
-askEnv :: EvalM DepsEnv
-askEnv = EvalM $ \env -> Right env
-
-localEnv :: (DepsEnv -> DepsEnv) -> EvalM a -> EvalM a
-localEnv f (EvalM m) = EvalM $ \env -> m (f env)
-
-failure :: String -> EvalM a
-failure s = EvalM $ \_env -> Left s
 
 -- | Merges two lists of that have the order instance.
 -- Used when combining two identifier sets which are always ordered
@@ -110,7 +134,7 @@ depValDeps (DepVal x) = x
 depValDeps (DepTuple x) = foldMap depValDeps x
 depValDeps (DepFun _ vn_n eb) = foldr idsWithout (Ids $ freeVarsList eb) vn_n
 
--- | Joins two different sets of DepVals
+-- | Joins two different sets of DepVal
 -- Only tuples of equal length can be joined without collapsing to pure DepVal Deps
 depValJoin :: DepVal -> DepVal -> DepVal
 depValJoin (DepTuple xs) (DepTuple ys)
@@ -273,7 +297,14 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
   env <- askEnv
   case stripPatBase pb of
-    Name vn -> localEnv (const $ envExtend vn d1 env) $ depsExpBase eb2
+    Name vn -> do
+      case d1 of
+        DepFun _ _ eb3 -> depsLog $ Depends vn $ DepVal $ Ids $ freeVarsList eb3
+         -- ^ Might lose some precision but it is to be able to represent
+         -- dependencies without abstract information 
+         -- This is partly because we don't know on which parameters the function is evaluated
+        _ -> depsLog $ Depends vn d1
+      localEnv (const $ envExtend vn d1 env) $ depsExpBase eb2
     _ -> failure $ "Unknown variable: " <> (show pb)
 depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (If eb1 eb2 eb3 _) = do
@@ -326,11 +357,6 @@ depsAppExpBase (Match eb ne_cb _) = do
   d_n <- mapM depsCaseBase (NE.toList ne_cb)
   pure $ foldr depValJoin (DepVal mempty) $ map (\x -> depValInj (depValDeps x) d1) d_n
   -- OBS use of injection (might need to be removed)
-
--- | Finds dependencies in loop initializer bases
--- depsLoopInitBase :: LoopInitBase Info  VName -> EvalM DepVal
--- depsLoopInitBase (LoopInitExplicit eb) = depsExpBase eb
--- depsLoopInitBase (LoopInitImplicit (Info eb)) = depsExpBase eb
 
 -- | Finds dependencies in case bases
 depsCaseBase :: CaseBase Info VName -> EvalM DepVal
@@ -425,13 +451,23 @@ depsSizeExp (SizeExpAny _) = pure $ DepVal mempty
 depsSliceBase :: SliceBase Info VName -> EvalM [DepVal]
 depsSliceBase = mapM depsDimIndexBase
 
--- | Runs the interpreter given a predefined environment in a monadic context
-runDeps :: DepsEnv -> EvalM a -> Either Error a
-runDeps env (EvalM m) = m env
+-- | Recursive executer of evaluation
+logDepsM :: DepsEnv -> EvalM a -> (Either Error a, [BoundDepVal])
+logDepsM _ (Pure x) = (Right x, [])
+logDepsM env (Free (ReadOp k)) = logDepsM env $ k env
+logDepsM env (Free (LogOp d1 x)) =
+  let (y, d2) = logDepsM env x
+    in (y, d2 ++ [d1])
+logDepsM _ (Free (ErrorOp e)) = (Left e, [])
+
+-- | Interpretation function for dependencies
+deps' :: DepsEnv -> Prog -> (Either Error DepVal, [BoundDepVal])
+deps' env prog = logDepsM env $ depsProgBase prog
 
 -- | Finds dependencies of a program
 deps :: Prog -> String
-deps prog =
-  case runDeps (depsFreeVarsInProgBase prog) (depsProgBase prog) of
-    Left a -> "Error in dependency interpreter: " ++ a 
-    Right a -> show a
+deps prog = 
+  case deps' (depsFreeVarsInProgBase prog) prog of
+    (Left a, _) -> "Error in dependency interpreter: " ++ a 
+    (Right a, d_n) -> "Expression depends on: " ++ show a ++
+                      "\nWith inner deps: " ++ (show d_n)
