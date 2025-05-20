@@ -1,6 +1,9 @@
 -- | Finds dependencies between variables in programs
 module Language.Futhark.Deps
-  ( deps
+  ( deps,
+    depsTestExp,
+    DepVal (..),
+    Ids (..)
   )
 where
 
@@ -25,8 +28,8 @@ data DepVal
   | DepFun DepsEnv [VName] (ExpBase Info VName)
   deriving (Eq, Show)
 
-data BoundDepVal = Depends VName DepVal
-  deriving (Show)
+data InnerDepVal = Depends VName DepVal
+  deriving (Eq, Show)
 
 type DepsEnv = M.Map VName DepVal
 
@@ -55,7 +58,7 @@ instance (Functor e) => Monad (Free e) where
       h x = x >>= f
 
 data EvalOp a
-  = LogOp BoundDepVal a
+  = LogOp InnerDepVal a
   | ReadOp (DepsEnv -> a)  
   | ErrorOp Error
 
@@ -66,7 +69,7 @@ instance Functor EvalOp where
 
 type EvalM a = Free EvalOp a 
 
-depsLog :: BoundDepVal -> EvalM ()
+depsLog :: InnerDepVal -> EvalM ()
 depsLog bdv = Free $ LogOp bdv $ pure ()
 
 askEnv :: EvalM DepsEnv
@@ -84,7 +87,6 @@ localEnv f = modifyEffects g
 
 failure :: String -> EvalM a
 failure = Free . ErrorOp
-
 
 -- | General environment functions. Relies heavily on module data.map
 envEmpty :: M.Map VName DepVal
@@ -460,7 +462,7 @@ bindingNameInDecBase (LocalDec db _) = bindingNameInDecBase db
 bindingNameInDecBase _ = Nothing
 
 -- | Recursive executer of evaluation
-logDepsM :: DepsEnv -> EvalM DepVal -> (Either Error DepVal, [BoundDepVal])
+logDepsM :: DepsEnv -> EvalM DepVal -> (Either Error DepVal, [InnerDepVal])
 logDepsM _ (Pure x) = (Right x, [])
 logDepsM env (Free (ReadOp k)) = logDepsM env $ k env
 logDepsM env (Free (LogOp d1 x)) =
@@ -469,8 +471,10 @@ logDepsM env (Free (LogOp d1 x)) =
 logDepsM _ (Free (ErrorOp e)) = (Left e, [])
 
 -- | Interpretation function for dependencies
-deps' :: DepsEnv -> Prog -> [(Maybe VName, (Either Error DepVal, [BoundDepVal]))]
-deps' env prog = zip (map bindingNameInDecBase $ progDecs prog) (map (\dec -> logDepsM env $ depsDecBase dec) $ progDecs prog)
+deps' :: DepsEnv -> Prog -> [(Maybe VName, (Either Error DepVal, [InnerDepVal]))]
+deps' env prog = zip
+                  (map bindingNameInDecBase $ progDecs prog)
+                  (map (logDepsM env . depsDecBase) $ progDecs prog)
 
 -- | Finds dependencies in a program
 deps :: Prog -> String
@@ -484,3 +488,11 @@ deps prog = foldr concatDeps "" $ deps' (depsFreeVarsInProgBase prog) prog
                   "Function: " ++ show vn ++ " depends on: " ++ show a ++ 
                   "\n    and has inner dependencies: " ++ show d_n ++ "\n" ++ acc 
 
+
+-- | Function for unit-testing specific parts of the ast
+depsTestExp :: ExpBase Info VName -> Either Error (DepVal, [InnerDepVal]) 
+depsTestExp eb =
+  case logDepsM (depsFreeVarsInExpBase eb) $ depsExpBase eb of
+    (Left e, _) -> Left e 
+    (Right d, id_n) -> Right (d, id_n)
+ 
