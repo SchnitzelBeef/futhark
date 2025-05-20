@@ -166,6 +166,8 @@ freeVarsList eb = S.toList $ FV.fvVars $ freeInExp eb
 -- | Converts pattern bases to pure NestedVNames. *UNFINISHED* and potentially unnecessary  
 stripPatBase :: PatBase Info VName t -> NestedVName
 stripPatBase (Id vn _ _) = Name vn
+stripPatBase (PatParens pb _) = stripPatBase pb
+stripPatBase (PatAscription pb _ _) = stripPatBase pb
 stripPatBase _ = WildcardName
 
 -- | Converts nested names to pure DepsEnv's, should be under careful revision..
@@ -174,18 +176,19 @@ nestedNamesToSelfEnv (Name vn) = envSingle vn (DepVal $ idsSingle vn)
 nestedNamesToSelfEnv (Nested nvn) = foldr envUnion envEmpty (map nestedNamesToSelfEnv nvn)
 nestedNamesToSelfEnv WildcardName = envEmpty
 
--- | Finds dependencies in program bases
--- Currently only observes the last part of the declarations
-depsProgBase :: ProgBase Info VName -> EvalM DepVal 
-depsProgBase base = depsDecBase $ last $ progDecs base
-
-depsDecBase :: DecBase Info VName-> EvalM DepVal
+-- | Finds dependencies in declaration bases ** UNFINISHED
+depsDecBase :: DecBase Info VName -> EvalM DepVal
 depsDecBase (ValDec bindings) = do
   env <- askEnv
   let env' = nestedNamesToSelfEnv $ Nested (map stripPatBase (valBindParams bindings)) 
     in localEnv (const $ env' `envUnion` env) (depsExpBase $ valBindBody bindings)
     -- ^^ envUnion above might be dangerous (prefers env' over env in duplicates)
-depsDecBase _ = failure "Unrecognized declaration base"
+depsDecBase (TypeDec _) = pure $ DepVal mempty -- OBS 
+depsDecBase (ModTypeDec _) = pure $ DepVal mempty -- OBS 
+depsDecBase (ModDec _) = pure $ DepVal mempty -- OBS 
+depsDecBase (OpenDec _ _) = pure $ DepVal mempty -- OBS 
+depsDecBase (LocalDec db _) = depsDecBase db 
+depsDecBase (ImportDec _ _ _) = pure $ DepVal mempty -- OBS
 
 -- | Finds dependencies in expression bases
 depsExpBase :: ExpBase Info VName -> EvalM DepVal
@@ -451,8 +454,13 @@ depsSizeExp (SizeExpAny _) = pure $ DepVal mempty
 depsSliceBase :: SliceBase Info VName -> EvalM [DepVal]
 depsSliceBase = mapM depsDimIndexBase
 
+bindingNameInDecBase :: DecBase Info VName -> Maybe VName
+bindingNameInDecBase (ValDec bindings) = Just $ valBindName bindings
+bindingNameInDecBase (LocalDec db _) = bindingNameInDecBase db 
+bindingNameInDecBase _ = Nothing
+
 -- | Recursive executer of evaluation
-logDepsM :: DepsEnv -> EvalM a -> (Either Error a, [BoundDepVal])
+logDepsM :: DepsEnv -> EvalM DepVal -> (Either Error DepVal, [BoundDepVal])
 logDepsM _ (Pure x) = (Right x, [])
 logDepsM env (Free (ReadOp k)) = logDepsM env $ k env
 logDepsM env (Free (LogOp d1 x)) =
@@ -461,13 +469,18 @@ logDepsM env (Free (LogOp d1 x)) =
 logDepsM _ (Free (ErrorOp e)) = (Left e, [])
 
 -- | Interpretation function for dependencies
-deps' :: DepsEnv -> Prog -> (Either Error DepVal, [BoundDepVal])
-deps' env prog = logDepsM env $ depsProgBase prog
+deps' :: DepsEnv -> Prog -> [(Maybe VName, (Either Error DepVal, [BoundDepVal]))]
+deps' env prog = zip (map bindingNameInDecBase $ progDecs prog) (map (\dec -> logDepsM env $ depsDecBase dec) $ progDecs prog)
 
--- | Finds dependencies of a program
+-- | Finds dependencies in a program
 deps :: Prog -> String
-deps prog = 
-  case deps' (depsFreeVarsInProgBase prog) prog of
-    (Left a, _) -> "Error in dependency interpreter: " ++ a 
-    (Right a, d_n) -> "Expression depends on: " ++ show a ++
-                      "\nWith inner deps: " ++ (show d_n)
+deps prog = foldr concatDeps "" $ deps' (depsFreeVarsInProgBase prog) prog
+  where
+        concatDeps (Nothing, _) acc = acc
+        concatDeps (Just vn, (Left e, _)) acc =
+                  "Error in dependency interpreter in function: " ++ show vn ++
+                  "\nError message: " ++ e ++ "\n" ++ acc 
+        concatDeps (Just vn, (Right a, d_n)) acc =
+                  "Function: " ++ show vn ++ " depends on: " ++ show a ++ 
+                  "\n    and has inner dependencies: " ++ show d_n ++ "\n" ++ acc 
+
