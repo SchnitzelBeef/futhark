@@ -542,6 +542,7 @@ test-suite unit
       Language.Futhark.SyntaxTests
       Language.Futhark.TypeChecker.TypesTests
       Language.Futhark.TypeCheckerTests
+      Language.Futhark.DepsTests
   build-depends:
       QuickCheck >=2.8
       , mtl >=2.2.1
