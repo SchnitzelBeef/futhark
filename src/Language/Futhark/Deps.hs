@@ -3,6 +3,8 @@ module Language.Futhark.Deps
   ( deps,
     depsTestExp,
     DepVal (..),
+    InnerDepVal (..),
+    NestedVName (..),
     Ids (..)
   )
 where
