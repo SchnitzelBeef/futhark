@@ -127,7 +127,7 @@ envLookup :: VName -> DepsEnv -> EvalM DepVal
 envLookup vn env = do
   case M.lookup vn env of
     Just x -> pure x
-    Nothing -> failure $ "Unknown variable: " <> (show vn) 
+    Nothing -> failure $ "Unknown variable: " <> (show vn)
 
 envUnion :: DepsEnv -> DepsEnv -> DepsEnv
 envUnion = M.union
@@ -202,25 +202,25 @@ stripPatBase (PatParens pb _) = stripPatBase pb
 stripPatBase (PatAscription pb _ _) = stripPatBase pb
 stripPatBase _ = WildcardName
 
--- | Converts nested names to pure DepsEnv's, should be under careful revision..
+-- | Converts nested names to pure DepsEnv's, should be used with care
 nestedNamesToSelfEnv :: NestedVName -> DepsEnv
 nestedNamesToSelfEnv (Name vn) = M.singleton vn $ DepVal $ idsSingle vn
 nestedNamesToSelfEnv (Tuple nvn) = foldr envUnion envEmpty (map nestedNamesToSelfEnv nvn)
 nestedNamesToSelfEnv WildcardName = envEmpty
 
--- | Finds dependencies in declaration bases ** UNFINISHED
+-- | Finds dependencies in declaration bases
 depsDecBase :: DecBase Info VName -> EvalM DepVal
 depsDecBase (ValDec bindings) = do
   env <- askEnv
   let env' = nestedNamesToSelfEnv $ Tuple (map stripPatBase (valBindParams bindings)) 
     in localEnv (const $ env' `envUnion` env) (depsExpBase $ valBindBody bindings)
     -- ^^ envUnion above might be dangerous (prefers env' over env in duplicates)
-depsDecBase (TypeDec _) = pure $ DepVal mempty -- OBS 
-depsDecBase (ModTypeDec _) = pure $ DepVal mempty -- OBS 
-depsDecBase (ModDec _) = pure $ DepVal mempty -- OBS 
-depsDecBase (OpenDec _ _) = pure $ DepVal mempty -- OBS 
+depsDecBase (TypeDec _) = failure "Does not support analysis of TypeDec"
+depsDecBase (ModTypeDec _) = failure "Does not support analysis of ModTypeDec"
+depsDecBase (ModDec _) = failure "Does not support analysis of ModDec"
+depsDecBase (OpenDec _ _) = failure "Does not support analysis of OpenDec"
 depsDecBase (LocalDec db _) = depsDecBase db 
-depsDecBase (ImportDec _ _ _) = pure $ DepVal mempty -- OBS
+depsDecBase (ImportDec _ _ _) = failure "Does not support analysis of ImportDec"
 
 -- | Finds dependencies in expression bases
 depsExpBase :: ExpBase Info VName -> EvalM DepVal
@@ -248,7 +248,7 @@ depsExpBase (ArrayLit eb_n _ _) = do
   d_n <- mapM depsExpBase eb_n
   pure $ foldr depValJoin (DepVal mempty) d_n
 depsExpBase (ArrayVal _ _ _) = pure $ DepVal mempty
-depsExpBase (Attr _ eb _) = depsExpBase eb -- OBS
+depsExpBase (Attr _ eb _) = depsExpBase eb 
 depsExpBase (Project name eb _ _) = do -- OBS, name has to be integer??
   d1 <- depsExpBase eb
   pure $
@@ -354,19 +354,23 @@ depsAppExpBase (Loop _ pb lib lfb eb  _) =
       d1 <- case lib of
         (LoopInitExplicit eb') -> depsExpBase eb'
         (LoopInitImplicit (Info eb')) -> depsExpBase eb'
+      env <- askEnv
+      loop_env <- case envExtend (Just vn) d1 env of
+        Right e -> pure e
+        Left e -> failure e
       case lfb of
         For ib' eb' -> do
-          d2 <- depsExpBase eb'
+          d2 <- localEnv (const loop_env) $ depsExpBase eb'
           d3 <- loop vn (Just $ Name $ identName ib') d1
           pure $ depValDeps d2 `depValInj` d3
         ForIn pb' eb' ->
           let vn' = Just $ stripPatBase pb'
             in do
-              d2 <- depsExpBase eb'
+              d2 <- localEnv (const loop_env) $ depsExpBase eb'
               d3 <- loop vn vn' d1
               pure $ depValDeps d2 `depValInj` d3
         While eb' -> do
-          d2 <- depsExpBase eb'
+          d2 <- localEnv (const loop_env) $ depsExpBase eb'
           d3 <- loop vn Nothing d1
           pure $ depValDeps d2 `depValInj` d3
       where loop :: NestedVName -> Maybe NestedVName -> DepVal -> EvalM DepVal
@@ -384,7 +388,7 @@ depsAppExpBase (BinOp _ _ eb1 eb2 _) = do
   d1 <- depsExpBase $ fst eb1
   d2 <- depsExpBase $ fst eb2
   pure $ d1 `depValJoin` d2
-depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- OBS, not sure what this construct is
+depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (Index eb sb _) = do
   d <- depsExpBase eb 
   d_n <- depsSliceBase sb
