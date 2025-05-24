@@ -3,7 +3,6 @@ module Language.Futhark.Deps
   ( deps,
     depsTestExp,
     DepVal (..),
-    InnerDepVal (..),
     NestedVName (..),
     Ids (..)
   )
@@ -30,12 +29,15 @@ data DepVal
   | DepFun DepsEnv [NestedVName] (ExpBase Info VName)
   deriving (Eq, Show)
 
-data InnerDepVal
-  = Depends NestedVName DepVal
+data BoundDepVal
+  = Depends VName DepVal
   | None
-  deriving (Eq, Show)
+  deriving Show
 
-type DepsEnv = M.Map VName DepVal
+type InnerDepVals = DepsEnv
+
+newtype DepsEnv = Env (M.Map VName DepVal)
+  deriving (Eq, Show)
 
 data NestedVName
   = Name VName
@@ -68,7 +70,7 @@ instance (Functor e) => Monad (Free e) where
       h x = x >>= f
 
 data EvalOp a
-  = LogOp InnerDepVal a
+  = LogOp DepsEnv a
   | ReadOp (DepsEnv -> a)  
   | ErrorOp Error
 
@@ -79,8 +81,8 @@ instance Functor EvalOp where
 
 type EvalM a = Free EvalOp a 
 
-depsLog :: InnerDepVal -> EvalM ()
-depsLog bdv = Free $ LogOp bdv $ pure ()
+depsLog :: DepsEnv -> EvalM ()
+depsLog env = Free $ LogOp env $ pure ()
 
 askEnv :: EvalM DepsEnv
 askEnv = Free $ ReadOp $ \env -> pure env
@@ -98,15 +100,14 @@ localEnv f = modifyEffects g
 failure :: String -> EvalM a
 failure = Free . ErrorOp
 
--- | General environment functions. Relies heavily on module data.map
-envEmpty :: DepsEnv
-envEmpty = M.empty
-
 envSingle :: Maybe NestedVName -> DepVal -> Either Error DepsEnv
-envSingle names d = envExtend names d envEmpty 
+envSingle names d = envExtend names d mempty
+
+envSinglePure :: VName -> DepVal -> DepsEnv
+envSinglePure vn d = Env $ M.singleton vn d
 
 envExtend :: Maybe NestedVName -> DepVal -> DepsEnv -> Either Error DepsEnv
-envExtend (Just (Name vn)) d env = Right $ M.insert vn d env
+envExtend (Just (Name vn)) d (Env env) = Right $ Env $ M.insert vn d env
 envExtend (Just (Tuple nest)) (DepTuple tpl) env
   | length nest == length tpl = foldr envUnionError (Right env) $ map (\(x, y) -> envSingle x y) $ zip (map Just nest) tpl
   | otherwise = Left $ 
@@ -118,24 +119,17 @@ envExtend (Just (Tuple nest)) d _ = Left $
 envExtend (Just WildcardName) _ env = Right env
 envExtend Nothing _ env = Right env
 -- Could argue that throwing an error instead is better for the wildcard case,
--- i.e. in AST bindings of "Let _ = 3 + 4 in ..."
-
-envExtendPure :: VName -> DepVal -> DepsEnv -> DepsEnv
-envExtendPure = M.insert
 
 envUnionError :: Either Error DepsEnv -> Either Error DepsEnv -> Either Error DepsEnv
 envUnionError (Left e) _ = Left e
 envUnionError  _ (Left e) = Left e
-envUnionError (Right env1) (Right env2) = Right $ envUnion env1 env2
+envUnionError (Right env1) (Right env2) = Right $ env1 <> env2
 
 envLookup :: VName -> DepsEnv -> EvalM DepVal
-envLookup vn env = do
+envLookup vn (Env env) = do
   case M.lookup vn env of
     Just x -> pure x
     Nothing -> failure $ "Unknown variable: " <> (show vn)
-
-envUnion :: DepsEnv -> DepsEnv -> DepsEnv
-envUnion = M.union
 
 -- | Merges two lists of that have the order instance.
 -- Used when combining two identifier sets which are always ordered
@@ -147,6 +141,13 @@ merge (x:xs) (y:ys)
   | x < y  = x : merge xs (y:ys)
   | x > y  = y : merge (x:xs) ys
   | otherwise = x : merge xs ys
+
+
+instance Semigroup DepsEnv where
+  Env x <> Env y = Env $ x `M.union` y 
+
+instance Monoid DepsEnv where
+  mempty = Env $ M.empty
 
 instance Semigroup Ids where
   Ids x <> Ids y = Ids $ merge x y
@@ -189,11 +190,11 @@ depsFreeVarsInProgBase :: ProgBase Info VName -> DepsEnv
 depsFreeVarsInProgBase base =
   case last $ progDecs base of 
     ValDec valbind -> depsFreeVarsInExpBase $ valBindBody valbind
-    _ -> envEmpty -- Should not return envEmpty
+    _ -> mempty -- Should not return mempty
 
 -- | Dependencies in ExpBase 
 depsFreeVarsInExpBase :: ExpBase Info VName -> DepsEnv
-depsFreeVarsInExpBase eb = M.fromList $ map (\x -> (x, DepVal $ idsSingle x)) $ freeVarsList eb
+depsFreeVarsInExpBase eb = Env $ M.fromList $ map (\x -> (x, DepVal $ idsSingle x)) $ freeVarsList eb
 
 -- | ExpBase to list of free variables in the form of VName's
 freeVarsList :: ExpBase Info VName -> [VName]
@@ -209,16 +210,16 @@ stripPatBase _ = WildcardName
 
 -- | Converts nested names to pure DepsEnv's, should be used with care
 nestedNamesToSelfEnv :: NestedVName -> DepsEnv
-nestedNamesToSelfEnv (Name vn) = M.singleton vn $ DepVal $ idsSingle vn
-nestedNamesToSelfEnv (Tuple nvn) = foldr envUnion envEmpty (map nestedNamesToSelfEnv nvn)
-nestedNamesToSelfEnv WildcardName = envEmpty
+nestedNamesToSelfEnv (Name vn) = Env $ M.singleton vn $ DepVal $ idsSingle vn
+nestedNamesToSelfEnv (Tuple nvn) = foldMap nestedNamesToSelfEnv nvn
+nestedNamesToSelfEnv WildcardName = mempty
 
 -- | Finds dependencies in declaration bases
 depsDecBase :: DecBase Info VName -> EvalM DepVal
 depsDecBase (ValDec bindings) = do
   env <- askEnv
   let env' = nestedNamesToSelfEnv $ Tuple (map stripPatBase (valBindParams bindings)) 
-    in localEnv (const $ env' `envUnion` env) (depsExpBase $ valBindBody bindings)
+    in localEnv (const $ env' <> env) (depsExpBase $ valBindBody bindings)
     -- ^^ envUnion above might be dangerous (prefers env' over env in duplicates)
 depsDecBase (TypeDec _) = failure "Does not support analysis of TypeDec"
 depsDecBase (ModTypeDec _) = failure "Does not support analysis of ModTypeDec"
@@ -337,17 +338,24 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
   env <- askEnv
   let name = stripPatBase pb
-    in do
-      case d1 of
-        DepFun _ _ eb3 -> depsLog $ Depends name $ DepVal $ Ids $ freeVarsList eb3
-         -- ^ Might lose some precision but it is to be able to represent
-         -- dependencies without abstract information 
-         -- This is partly because we don't know on which parameters the function is evaluated
-        _ -> depsLog $ Depends name d1
+    in do 
+      log' d1 name
       env' <- case envExtend (Just name) d1 env of
         (Left e) -> failure e
         (Right e) -> pure e
       localEnv (const env') $ depsExpBase eb2
+      where log' :: DepVal -> NestedVName -> EvalM ()
+            log' (DepFun _ _ eb) (Name vn) = depsLog $ envSinglePure vn $ DepVal $ Ids $ freeVarsList eb 
+              -- ^ Might lose some precision but it is to be able to represent
+              -- dependencies without abstract information 
+              -- This is partly because we don't know on which parameters the function is evaluated
+            log' d (Name vn) = depsLog $ envSinglePure vn d -- OBS
+            log' _ (Tuple []) = pure ()
+            log' (DepTuple (a:b)) (Tuple (c:d)) = do
+              log' a c
+              log' (DepTuple b) (Tuple d)
+            log' _ WildcardName = pure ()
+            log' a b = failure $ "Failed to log an inner dependence between " <> show b <> " and " <> show a 
 depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
@@ -385,7 +393,7 @@ depsAppExpBase (Loop _ pb lib lfb eb  _) =
                   env' <- case (envSingle i (DepVal mempty), envSingle (Just p) ld) of
                             (Left e, _) -> failure e
                             (_, Left e) -> failure e
-                            (Right env1, Right env2) -> pure $ env `envUnion` env1 `envUnion` env2
+                            (Right env1, Right env2) -> pure $ env <> env1 <> env2
                   ld' <- localEnv (const env') (depsExpBase eb)
                   if ld == ld'
                     then pure ld'
@@ -498,53 +506,57 @@ depsSizeExp (SizeExpAny _) = pure $ DepVal mempty
 depsSliceBase :: SliceBase Info VName -> EvalM [DepVal]
 depsSliceBase = mapM depsDimIndexBase
 
--- Finds the relation between the name and the explicit ExpBase definition i a DecBase
-bindingInDecBase :: DecBase Info VName -> InnerDepVal
-bindingInDecBase (ValDec bind) = 
-  let func = DepFun envEmpty (map stripPatBase $ valBindParams bind) (valBindBody bind)
-    in Depends (Name $ valBindName bind) func
-bindingInDecBase (LocalDec db _) = bindingInDecBase db 
-bindingInDecBase _ = None
-
 -- | Recursive executer of evaluation
-logDepsM :: DepsEnv -> EvalM DepVal -> (Either Error DepVal, [InnerDepVal])
-logDepsM _ (Pure x) = (Right x, [])
+logDepsM :: DepsEnv -> EvalM DepVal -> (Either Error DepVal, InnerDepVals)
+logDepsM _ (Pure x) = (Right x, mempty)
 logDepsM env (Free (ReadOp k)) = logDepsM env $ k env
 logDepsM env (Free (LogOp d1 x)) =
   let (y, d2) = logDepsM env x
-    in (y, d2 ++ [d1])
-logDepsM _ (Free (ErrorOp e)) = (Left e, [])
+    in (y, d2 <> d1)
+logDepsM _ (Free (ErrorOp e)) = (Left e, mempty)
+
+-- Finds the relation between the name and the explicit ExpBase definition i a DecBase
+bindingInDecBase :: DecBase Info VName -> BoundDepVal
+bindingInDecBase (ValDec bind) = 
+  let func = DepFun mempty (map stripPatBase $ valBindParams bind) (valBindBody bind)
+    in Depends (valBindName bind) func
+bindingInDecBase (LocalDec db _) = bindingInDecBase db 
+bindingInDecBase _ = None
 
 -- | Interpretation function for dependencies
-deps' :: DepsEnv -> Prog -> [(InnerDepVal, (Either Error DepVal, [InnerDepVal]))]
+deps' :: DepsEnv -> Prog -> [(Either (Maybe VName, Error) (Maybe VName, DepVal, InnerDepVals))]
 deps' env prog = 
-  let name_depval_n = map bindingInDecBase $ progDecs prog
-      func_env = foldr foldEnv env name_depval_n -- A two pass scan*
-    in zip (map bindingInDecBase $ progDecs prog) (map (logDepsM func_env . depsDecBase) $ progDecs prog)
-      where foldEnv :: InnerDepVal -> DepsEnv -> DepsEnv
-            foldEnv (Depends (Name vn) func) env' = envExtendPure vn func env' 
-            foldEnv _ env' = env'
-            -- Returns (VName, DepFun) with empty env
-            -- This is allowed since the functions are top level definitions
+  let bindings = map bindingInDecBase $ progDecs prog
+      env' = foldMap joinBindings bindings -- A two pass scan*
+        where joinBindings :: BoundDepVal -> DepsEnv
+              joinBindings (Depends vn d) = envSinglePure vn d
+              joinBindings _ = mempty 
+  in map repack $ zip bindings $ map (logDepsM (env' <> env) . depsDecBase) $ progDecs prog
+        where repack :: (BoundDepVal, (Either Error DepVal, InnerDepVals)) -> (Either (Maybe VName, Error) (Maybe VName, DepVal, InnerDepVals))
+              repack (Depends vn _, (Right d2, d3)) = Right (Just vn, d2, d3)
+              repack (None, (Right d2, d3)) = Right (Nothing, d2, d3)
+              repack (Depends vn _, (Left e, _)) = Left $ (Just vn, e) 
+              repack (None, (Left e, _)) = Left $ (Nothing, e) 
+
+
 -- *Turns out this is unnecessary since Futhark doesn't do support functions defined later in the program :-)  
 
 -- | Finds dependencies in a program
 deps :: Prog -> String
 deps prog = foldr concatDeps "" $ deps' (depsFreeVarsInProgBase prog) prog
-  where concatDeps :: (InnerDepVal, (Either Error DepVal, [InnerDepVal])) -> String -> String
-        concatDeps ((Depends (Name vn) _), (Left e, _)) acc =
-                  "\ESC[31mError in dependency interpreter in function: \ESC[36m"
-                  ++ show vn ++
-                  "\n\ESC[0m\tError message: " ++ e ++ "\n"  ++ acc 
-        concatDeps ((Depends (Name vn) _), (Right a, d_n)) acc =
+  where concatDeps :: Either (Maybe VName, Error) (Maybe VName, DepVal, InnerDepVals) -> String -> String
+        concatDeps (Right (vn, d, Env d_n)) acc =
                   "Function: \ESC[95m" ++ show vn ++
-                  "\n\ESC[0m\tDependencies: \ESC[36m" ++ show a ++ 
-                  "\n\ESC[0m\tInner dependencies: \ESC[36m"
-                  ++ (show d_n) ++ "\ESC[0m\n" ++ acc 
-        concatDeps (_, _) acc = acc 
+                  "\n\ESC[0m\tDependencies: \ESC[36m" ++ show d ++ 
+                  "\n\ESC[0m\tInner dependencies: \ESC[36m" ++ 
+                  (foldr (\(k, a) x -> x ++ "\n\t\t" ++ show k ++ " depends on " ++ show a) "" $ M.toList d_n)
+                  ++ "\ESC[0m\n" ++ acc 
+        concatDeps (Left (vn, e)) acc =
+                  "\ESC[31mError in dependency interpreter in function: \ESC[95m" ++ show vn ++
+                  "\n\ESC[0m\tError message: " ++ e ++ "\n" ++ acc 
 
 -- | Function for unit-testing specific parts of the ast
-depsTestExp :: ExpBase Info VName -> Either Error (DepVal, [InnerDepVal]) 
+depsTestExp :: ExpBase Info VName -> Either Error (DepVal, DepsEnv) 
 depsTestExp eb =
   case logDepsM (depsFreeVarsInExpBase eb) $ depsExpBase eb of
     (Left e, _) -> Left e 
