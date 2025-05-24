@@ -398,10 +398,12 @@ depsAppExpBase (Loop _ pb lib lfb eb  _) =
                   if ld == ld'
                     then pure ld'
                     else loop p i $ ld `depValJoin` ld' 
-depsAppExpBase (BinOp _ _ eb1 eb2 _) = do
-  d1 <- depsExpBase $ fst eb1
-  d2 <- depsExpBase $ fst eb2
-  pure $ d1 `depValJoin` d2
+depsAppExpBase (BinOp qn _ eb1 eb2 _) = do
+  env <- askEnv
+  d1 <- envLookup (qualLeaf $ fst qn) env
+  d2 <- depsExpBase $ fst eb1
+  d3 <- depsExpBase $ fst eb2
+  pure $ d1 `depValJoin` d2 `depValJoin` d3
 depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (Index eb sb _) = do
   d <- depsExpBase eb 
