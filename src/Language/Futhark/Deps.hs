@@ -14,7 +14,7 @@ import Data.Map qualified as M
 import Language.Futhark
 import Language.Futhark.FreeVars as FV
 import Data.List.NonEmpty qualified as NE
-import Data.List (sortOn)
+import Data.List (sortOn, elemIndex)
 
 type Error = String
 
@@ -23,9 +23,12 @@ newtype Ids = Ids [VName]
 
 type Deps = Ids
 
+data Struct = DepRecord | DepTuple 
+  deriving (Eq, Show)
+
 data DepVal
   = DepVal Ids
-  | DepRecord [(Name, DepVal)]
+  | DepGroup Struct [(Name, DepVal)]
   | DepFun DepsEnv [NestedVName] (ExpBase Info VName)
   deriving (Eq, Show)
 
@@ -108,8 +111,8 @@ envSinglePure vn d = Env $ M.singleton vn d
 
 envExtend :: Maybe NestedVName -> DepVal -> DepsEnv -> Either Error DepsEnv
 envExtend (Just (Name vn)) d (Env env) = Right $ Env $ M.insert vn d env
-envExtend (Just (RecordName [])) (DepRecord []) env = Right env
-envExtend (Just (RecordName r1)) (DepRecord r2) env =
+envExtend (Just (RecordName [])) (DepGroup _ []) env = Right env
+envExtend (Just (RecordName r1)) (DepGroup _ r2) env =
   let (names1, tpl1) = unzip r1
       (names2, tpl2) = unzip r2 
     in
@@ -170,7 +173,7 @@ idsWithout x (Ids xs) = Ids $ filter (/=x) xs
 -- | Extracting pure identifiers from DepVal
 depValDeps :: DepVal -> Deps
 depValDeps (DepVal x) = x
-depValDeps (DepRecord x) = foldMap depValDeps $ map snd x
+depValDeps (DepGroup _ x) = foldMap depValDeps $ map snd x
 depValDeps (DepFun _ lst eb) = foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedVNameDeps lst
     where nestedVNameDeps :: NestedVName -> [VName]
           nestedVNameDeps (Name vn) = [vn]
@@ -180,21 +183,21 @@ depValDeps (DepFun _ lst eb) = foldr idsWithout (Ids $ freeVarsList eb) $ concat
 -- | Joins two different sets of DepVal
 -- Only records of equal length and fields can be joined without collapsing to pure DepVal Deps
 depValJoin :: DepVal -> DepVal -> DepVal
-depValJoin x@(DepRecord xs) y@(DepRecord ys) =
+depValJoin x@(DepGroup t xs) y@(DepGroup _ ys) =
   let (names1, tpl1) = unzip xs
       (names2, tpl2) = unzip ys
     in
-      if names1 == names2
-        then DepRecord $ zip names1 $ zipWith depValJoin tpl1 tpl2
+      if names1 == names2 
+        then DepGroup t $ zip names1 $ zipWith depValJoin tpl1 tpl2
         else DepVal $ depValDeps x <> depValDeps y
 depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 
 -- | Injects dependencies into expressions which is useful in conditionals
 depValInj :: Deps -> DepVal -> DepVal
 depValInj x (DepVal y) = DepVal $ x <> y
-depValInj x (DepRecord ys) = 
+depValInj x (DepGroup t ys) = 
   let (names, tpl) = unzip ys
-    in DepRecord $ zip names $ map (depValInj x) tpl
+    in DepGroup t $ zip names $ map (depValInj x) tpl
 depValInj x v = DepVal $ x <> depValDeps v
 
 -- | Locates free variables in the body of ProgBase
@@ -263,10 +266,10 @@ depsExpBase (QualParens qn eb _) = do
   pure $ d1 `depValJoin` d2
 depsExpBase (TupLit ebn _) = do
   d_n <- mapM depsExpBase ebn
-  pure $ DepRecord $ createRecordTuple d_n
+  pure $ DepGroup DepTuple $ createRecordTuple d_n
 depsExpBase (RecordLit fb_n _) = do
   d_n <- mapM depsFieldBase fb_n
-  pure $ DepRecord $ sortOn fst $ zip (map extractFieldBaseName fb_n) d_n
+  pure $ DepGroup DepRecord $ sortOn fst $ zip (map extractFieldBaseName fb_n) d_n
   where extractFieldBaseName :: FieldBase Info VName -> Name
         extractFieldBaseName (RecordFieldExplicit (L _ name) _ _) = name
         extractFieldBaseName (RecordFieldImplicit (L _ (VName name _)) _ _) = name
@@ -278,19 +281,12 @@ depsExpBase (Attr _ eb _) = depsExpBase eb
 depsExpBase (Project name eb _ _) = do
   d1 <- depsExpBase eb
   case d1 of
-    (DepRecord r) ->
+    (DepGroup _ r) ->
       let (names, tpl) = unzip r
-          i = contains name names 0
-        in
-          if i == -1
-            then failure $ "Projection of tuple/record out of bounds with name "
-              <> show name <> "\ton:\t" <> show r  
-            else pure $ tpl !! i
-          where contains :: Eq a => a -> [a] -> Int -> Int
-                contains _ [] _ = -1
-                contains elm (h:t) cnt
-                  | elm == h = cnt
-                  | otherwise = contains elm t $ cnt + 1
+          i = elemIndex name names
+        in case i of
+            (Just i') -> pure $ tpl !! i'
+            Nothing -> failure $ "Projection of tuple/record out of bounds with name "
     _ -> failure "Tried to project a non-tuple/record"
 depsExpBase (Negate eb _) = depsExpBase eb
 depsExpBase (Not eb _) = depsExpBase eb
@@ -377,9 +373,9 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
       where log' :: DepVal -> NestedVName -> EvalM ()
             log' d (Name vn) = depsLog $ envSinglePure vn $ DepVal $ depValDeps d
             log' _ (RecordName []) = pure ()
-            log' (DepRecord (a:b)) (RecordName (c:d)) = do
+            log' (DepGroup t (a:b)) (RecordName (c:d)) = do
               log' (snd a) (snd c) -- OBS
-              log' (DepRecord b) (RecordName d)
+              log' (DepGroup t b) (RecordName d)
             log' _ WildcardName = pure ()
             log' a b = failure $ "Failed to log an inner dependence between " <> show b <> " and " <> show a 
 depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
@@ -461,7 +457,7 @@ depsDimIndexBase (DimSlice maybe_eb1 maybe_eb2 maybe_eb3) = do
 depsPatBase :: PatBase Info VName t -> EvalM DepVal
 depsPatBase (TuplePat pb_n _) = do
   d_n <- mapM depsPatBase pb_n
-  pure $ DepRecord $ createRecordTuple d_n 
+  pure $ DepGroup DepTuple $ createRecordTuple d_n 
 depsPatBase (RecordPat rcrd _) = do
   d_n <- mapM (depsPatBase . snd) rcrd
   pure $ foldr depValJoin (DepVal mempty) d_n
@@ -486,7 +482,7 @@ depsTypeExp (TEVar qn _) = do
 depsTypeExp (TEParens te _) = depsTypeExp te
 depsTypeExp (TETuple te_n _) = do
   d_n <- mapM depsTypeExp te_n
-  pure $ DepRecord $ createRecordTuple d_n
+  pure $ DepGroup DepTuple $ createRecordTuple d_n
 depsTypeExp (TERecord lst _) = do
   d_n <- mapM (depsTypeExp . snd) lst
   pure $ foldr depValJoin (DepVal mempty) d_n
@@ -565,7 +561,6 @@ deps' env prog =
               repack (None, (Right d2, d3)) = Right (Nothing, d2, d3)
               repack (Depends vn _, (Left e, _)) = Left $ (Just vn, e) 
               repack (None, (Left e, _)) = Left $ (Nothing, e) 
-
 -- *Turns out this is unnecessary since Futhark doesn't do support functions defined later in the program :-)  
 
 -- | Finds dependencies in a program
