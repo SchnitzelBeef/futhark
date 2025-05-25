@@ -345,11 +345,7 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
         (Right e) -> pure e
       localEnv (const env') $ depsExpBase eb2
       where log' :: DepVal -> NestedVName -> EvalM ()
-            log' (DepFun _ _ eb) (Name vn) = depsLog $ envSinglePure vn $ DepVal $ Ids $ freeVarsList eb 
-              -- ^ Might lose some precision but it is to be able to represent
-              -- dependencies without abstract information 
-              -- This is partly because we don't know on which parameters the function is evaluated
-            log' d (Name vn) = depsLog $ envSinglePure vn d -- OBS
+            log' d (Name vn) = depsLog $ envSinglePure vn $ DepVal $ depValDeps d
             log' _ (Tuple []) = pure ()
             log' (DepTuple (a:b)) (Tuple (c:d)) = do
               log' a c
