@@ -191,8 +191,8 @@ depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 -- | Injects dependencies into expressions which is useful in conditionals
 depValInj :: Deps -> DepVal -> DepVal
 depValInj x (DepVal y) = DepVal $ x <> y
-depValInj x (DepGroup t ys) = 
-  let (names, tpl) = unzip $ TPL.sortFields ys
+depValInj x (DepGroup t r) = 
+  let (names, tpl) = unzip $ TPL.sortFields r
     in DepGroup t $ M.fromList $ zip names $ map (depValInj x) tpl
 depValInj x v = DepVal $ x <> depValDeps v
 
@@ -368,20 +368,23 @@ logDep a b = failure $ "Failed to log an inner dependence between " <> show b <>
 depsAppExpBase :: AppExpBase Info VName -> EvalM DepVal
 depsAppExpBase (Apply eb lst _) = do
   d1 <- depsExpBase eb
-  d_n <- mapM depsExpBase $ map snd (NE.toList lst)
+  d_n <- mapM depsExpBase $ map snd $ NE.toList lst
   case d1 of 
     DepFun env' n_n body -> do
       fun_env <- case foldr envUnionError (Right env') $ zipWith envSingle (map Just n_n) d_n of
-        Left e -> failure e
-        Right e -> pure e 
+                  Left e -> failure e
+                  Right e -> pure e 
       localEnv (const fun_env) $ depsExpBase body
+    {- Meeting a function that it does not know, it is simply a conservative 
+       estimate that it uses all the free variables inside the expression, which
+       are uncovered through depValJoin  
+      -}
     _ -> pure $ foldr depValJoin d1 d_n
 depsAppExpBase (Range eb1 maybe_eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
   pure $ d1 `depValJoin` d2
-depsAppExpBase (LetPat sb_n pb eb1 eb2 _) = do
-  d0 <- depsSizeBinderList sb_n
+depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
   env <- askEnv
   let name = extractPatBaseName pb
@@ -390,15 +393,14 @@ depsAppExpBase (LetPat sb_n pb eb1 eb2 _) = do
       env' <- case envExtend (Just name) d1 env of
         (Left e) -> failure e
         (Right e) -> pure e
-      d2 <- localEnv (const env') $ depsExpBase eb2
-      pure $ d0 `depValJoin` d2
+      localEnv (const env') $ depsExpBase eb2
 depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
   d3 <- depsExpBase eb3
   pure $ depValDeps d1 `depValInj` (d2 `depValJoin` d3)
-depsAppExpBase (Loop _ pb lib lfb eb  _) = 
+depsAppExpBase (Loop _ pb lib lfb eb _) = 
   let vn = extractPatBaseName pb
     in do
       d1 <- case lib of
@@ -425,21 +427,19 @@ depsAppExpBase (Loop _ pb lib lfb eb  _) =
           pure $ depValDeps d2 `depValInj` d3
       where loop :: NestedName -> Maybe NestedName -> DepVal -> EvalM DepVal
             loop p i ld = do
-                  env  <- askEnv
-                  env' <- case (envSingle i (DepVal mempty), envSingle (Just p) ld) of
-                            (Left e, _) -> failure e
-                            (_, Left e) -> failure e
-                            (Right env1, Right env2) -> pure $ env <> env1 <> env2 -- OBS env 2 first, maybe make recursive instead
-                  ld' <- localEnv (const env') (depsExpBase eb)
-                  if ld == ld'
-                    then pure ld'
-                    else loop p i $ ld `depValJoin` ld' 
-depsAppExpBase (BinOp qn _ eb1 eb2 _) = do
-  env <- askEnv
-  d1 <- envLookup (qualLeaf $ fst qn) env
-  d2 <- depsExpBase $ fst eb1
-  d3 <- depsExpBase $ fst eb2
-  pure $ d1 `depValJoin` d2 `depValJoin` d3
+              env  <- askEnv
+              env' <- case (envSingle i (DepVal mempty), envSingle (Just p) ld) of
+                        (Left e, _) -> failure e
+                        (_, Left e) -> failure e
+                        (Right env1, Right env2) -> pure $ env2 <> env1 <> env
+              ld' <- localEnv (const env') $ depsExpBase eb
+              if ld == ld'
+                then pure ld'
+                else loop p i $ ld `depValJoin` ld' 
+depsAppExpBase (BinOp _ _ eb1 eb2 _) = do
+  d1 <- depsExpBase $ fst eb1
+  d2 <- depsExpBase $ fst eb2
+  pure $ d1 `depValJoin` d2
 depsAppExpBase (LetWith _ _ _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (Index eb sb _) = do
   d <- depsExpBase eb 
