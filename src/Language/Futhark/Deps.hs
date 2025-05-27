@@ -3,7 +3,7 @@ module Language.Futhark.Deps
   ( deps,
     depsTestExp,
     DepVal (..),
-    NestedVName (..),
+    NestedName (..),
     Ids (..)
   )
 where
@@ -13,8 +13,10 @@ import Control.Monad
 import Data.Map qualified as M
 import Language.Futhark
 import Language.Futhark.FreeVars as FV
+import Language.Futhark.Tuple as TPL
 import Data.List.NonEmpty qualified as NE
-import Data.List (sortOn, elemIndex)
+import Data.List
+import Data.Maybe (isJust)
 
 type Error = String
 
@@ -23,13 +25,19 @@ newtype Ids = Ids [VName]
 
 type Deps = Ids
 
+data NestedName
+  = Name VName
+  | RecordName (M.Map Name NestedName)
+  | WildcardName
+  deriving (Eq, Show)
+
 data Struct = DepRecord | DepTuple 
   deriving (Eq, Show)
 
 data DepVal
   = DepVal Ids
-  | DepGroup Struct [(Name, DepVal)]
-  | DepFun DepsEnv [NestedVName] (ExpBase Info VName)
+  | DepGroup Struct (M.Map Name DepVal)
+  | DepFun DepsEnv [NestedName] (ExpBase Info VName)
   deriving (Eq, Show)
 
 data BoundDepVal
@@ -41,18 +49,6 @@ type InnerDepVals = DepsEnv
 
 newtype DepsEnv = Env (M.Map VName DepVal)
   deriving (Eq, Show)
-
-data NestedVName
-  = Name VName
-  | RecordName [(Name, NestedVName)] 
-  | WildcardName
-  deriving (Eq, Show)
-{-  
-    Could add a "lambdaParam [NestedVName] instance for functions,
-    but this would only be for internal purposes.
-    Right now this is fixed by having DepFun take a list of NestedVName
-    which are the parameters of a function
--}
 
 data Free e a
   = Pure a
@@ -103,23 +99,24 @@ localEnv f = modifyEffects g
 failure :: String -> EvalM a
 failure = Free . ErrorOp
 
-envSingle :: Maybe NestedVName -> DepVal -> Either Error DepsEnv
+envSingle :: Maybe NestedName -> DepVal -> Either Error DepsEnv
 envSingle names d = envExtend names d mempty
 
 envSinglePure :: VName -> DepVal -> DepsEnv
 envSinglePure vn d = Env $ M.singleton vn d
 
-envExtend :: Maybe NestedVName -> DepVal -> DepsEnv -> Either Error DepsEnv
+envExtend :: Maybe NestedName -> DepVal -> DepsEnv -> Either Error DepsEnv
 envExtend (Just (Name vn)) d (Env env) = Right $ Env $ M.insert vn d env
-envExtend (Just (RecordName [])) (DepGroup _ []) env = Right env
-envExtend (Just (RecordName r1)) (DepGroup _ r2) env =
-  let (names1, tpl1) = unzip r1
-      (names2, tpl2) = unzip r2 
-    in
-      if names1 == names2
-        then foldr envUnionError (Right env) $ map (\(x, y) -> envSingle (Just x) y) $ zip tpl1 tpl2
-        else Left $ "Tried to extend environment non-matching records: " <>
-              show r1 <> "\tand:\t" <> show r2
+envExtend (Just (RecordName r1)) (DepGroup _ r2) env
+  | null r1 && null r2 = Right env
+  | otherwise =
+    let (names1, tpl1) = unzip $ TPL.sortFields r1
+        (names2, tpl2) = unzip $ TPL.sortFields r2 
+      in
+        if names1 == names2
+          then foldr envUnionError (Right env) $ map (\(x, y) -> envSingle (Just x) y) $ zip tpl1 tpl2
+          else Left $ "Tried to extend environment non-matching records: " <>
+                show r1 <> "\tand:\t" <> show r2
 envExtend (Just (RecordName r)) d _ = Left $ 
       "Tried to extend environment with patterns of different dimensions: "
       ++ show r ++ "\tand:\t" ++ show d
@@ -137,9 +134,6 @@ envLookup vn (Env env) = do
     Just x -> pure x
     Nothing -> failure $ "Unknown variable: " <> (show vn)
 
-createRecordTuple :: [a] -> [(Name, a)]
-createRecordTuple lst = zip (map (nameFromString . show) [0 .. length lst]) lst
-
 -- | Merges two lists of that have the order instance.
 -- Used when combining two identifier sets which are always ordered
 merge :: Ord a => [a] -> [a] -> [a]
@@ -151,6 +145,8 @@ merge (x:xs) (y:ys)
   | x > y  = y : merge (x:xs) ys
   | otherwise = x : merge xs ys
 
+instance Semigroup DepVal where 
+  (<>) = depValJoin -- OBS
 
 instance Semigroup DepsEnv where
   Env x <> Env y = Env $ x `M.union` y 
@@ -173,22 +169,22 @@ idsWithout x (Ids xs) = Ids $ filter (/=x) xs
 -- | Extracting pure identifiers from DepVal
 depValDeps :: DepVal -> Deps
 depValDeps (DepVal x) = x
-depValDeps (DepGroup _ x) = foldMap depValDeps $ map snd x
-depValDeps (DepFun _ lst eb) = foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedVNameDeps lst
-    where nestedVNameDeps :: NestedVName -> [VName]
-          nestedVNameDeps (Name vn) = [vn]
-          nestedVNameDeps (RecordName x) = concat $ map (nestedVNameDeps . snd) x
-          nestedVNameDeps WildcardName = mempty
+depValDeps (DepGroup _ x) = foldMap (depValDeps . snd) $ TPL.sortFields x
+depValDeps (DepFun _ lst eb) = foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedNameDeps lst
+  where nestedNameDeps :: NestedName -> [VName]
+        nestedNameDeps (Name vn) = [vn]
+        nestedNameDeps (RecordName x) = concat $ map (nestedNameDeps . snd) $ M.toList x
+        nestedNameDeps WildcardName = mempty
 
 -- | Joins two different sets of DepVal
 -- Only records of equal length and fields can be joined without collapsing to pure DepVal Deps
 depValJoin :: DepVal -> DepVal -> DepVal
-depValJoin x@(DepGroup t xs) y@(DepGroup _ ys) =
-  let (names1, tpl1) = unzip xs
-      (names2, tpl2) = unzip ys
+depValJoin x@(DepGroup t r1) y@(DepGroup _ r2) =
+  let (names1, tpl1) = unzip $ TPL.sortFields r1
+      (names2, tpl2) = unzip $ TPL.sortFields r2
     in
       if names1 == names2 
-        then DepGroup t $ zip names1 $ zipWith depValJoin tpl1 tpl2
+        then DepGroup t $ M.fromList $ zip names1 $ zipWith depValJoin tpl1 tpl2
         else DepVal $ depValDeps x <> depValDeps y
 depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 
@@ -196,8 +192,8 @@ depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 depValInj :: Deps -> DepVal -> DepVal
 depValInj x (DepVal y) = DepVal $ x <> y
 depValInj x (DepGroup t ys) = 
-  let (names, tpl) = unzip ys
-    in DepGroup t $ zip names $ map (depValInj x) tpl
+  let (names, tpl) = unzip $ TPL.sortFields ys
+    in DepGroup t $ M.fromList $ zip names $ map (depValInj x) tpl
 depValInj x v = DepVal $ x <> depValDeps v
 
 -- | Locates free variables in the body of ProgBase
@@ -216,10 +212,10 @@ depsFreeVarsInExpBase eb = Env $ M.fromList $ map (\x -> (x, DepVal $ idsSingle 
 freeVarsList :: ExpBase Info VName -> [VName]
 freeVarsList eb = S.toList $ FV.fvVars $ freeInExp eb
 
--- | Converts pattern bases to pure NestedVNames ** UNFINISHED
-extractPatBaseName :: PatBase Info VName t -> NestedVName
-extractPatBaseName (TuplePat pb_n _) = RecordName $ createRecordTuple (map extractPatBaseName pb_n)
-extractPatBaseName (RecordPat npb_n _) = RecordName $ sortOn fst $ map (\(L _ x, y) -> (x, extractPatBaseName y)) npb_n
+-- | Converts pattern bases to pure NestedNames ** UNFINISHED
+extractPatBaseName :: PatBase Info VName t -> NestedName
+extractPatBaseName (TuplePat pb_n _) = RecordName $ TPL.tupleFields $ map extractPatBaseName pb_n
+extractPatBaseName (RecordPat npb_n _) = RecordName $ M.fromList $ map (\(L _ x, y) -> (x, extractPatBaseName y)) npb_n
 extractPatBaseName (PatParens pb _) = extractPatBaseName pb
 extractPatBaseName (Id vn _ _) = Name vn
 extractPatBaseName (PatAscription pb _ _) = extractPatBaseName pb
@@ -228,9 +224,9 @@ extractPatBaseName _ = WildcardName
 
 
 -- | Converts nested names to pure DepsEnv's, should be used with care
-nestedNamesToSelfEnv :: NestedVName -> DepsEnv
+nestedNamesToSelfEnv :: NestedName -> DepsEnv
 nestedNamesToSelfEnv (Name vn) = Env $ M.singleton vn $ DepVal $ idsSingle vn
-nestedNamesToSelfEnv (RecordName nv_n) = foldMap (nestedNamesToSelfEnv . snd) nv_n
+nestedNamesToSelfEnv (RecordName nv_n) = foldMap (nestedNamesToSelfEnv . snd) $ M.toList nv_n
 nestedNamesToSelfEnv WildcardName = mempty
 
 -- | Finds dependencies in declaration bases
@@ -266,10 +262,10 @@ depsExpBase (QualParens qn eb _) = do
   pure $ d1 `depValJoin` d2
 depsExpBase (TupLit ebn _) = do
   d_n <- mapM depsExpBase ebn
-  pure $ DepGroup DepTuple $ createRecordTuple d_n
+  pure $ DepGroup DepTuple $ TPL.tupleFields d_n
 depsExpBase (RecordLit fb_n _) = do
   d_n <- mapM depsFieldBase fb_n
-  pure $ DepGroup DepRecord $ sortOn fst $ zip (map extractFieldBaseName fb_n) d_n
+  pure $ DepGroup DepRecord $ M.fromList $ zip (map extractFieldBaseName fb_n) d_n
   where extractFieldBaseName :: FieldBase Info VName -> Name
         extractFieldBaseName (RecordFieldExplicit (L _ name) _ _) = name
         extractFieldBaseName (RecordFieldImplicit (L _ (VName name _)) _ _) = name
@@ -282,7 +278,7 @@ depsExpBase (Project name eb _ _) = do
   d1 <- depsExpBase eb
   case d1 of
     (DepGroup _ r) ->
-      let (names, tpl) = unzip r
+      let (names, tpl) = unzip $ TPL.sortFields r
           i = elemIndex name names
         in case i of
             (Just i') -> pure $ tpl !! i'
@@ -302,10 +298,21 @@ depsExpBase (Update eb1 sb eb2 _) = do
   d2 <- depsExpBase eb2
   d_n <- depsSliceBase sb
   pure $ foldr depValJoin (d1 `depValJoin` d2) d_n
-depsExpBase (RecordUpdate eb1 _ eb2 _ _) = do -- OBS
+depsExpBase (RecordUpdate eb1 n_n eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
-  pure $ d1 `depValJoin` d2
+  rcrdUpdate d1 d2 $ length n_n
+  where rcrdUpdate :: DepVal -> DepVal -> Int -> EvalM DepVal
+        rcrdUpdate (DepGroup t rcrd) d' 1 | isJust $ M.lookup (head n_n) rcrd = do -- OBS use envLookup instead
+          pure $ DepGroup t $ M.update (\_ -> Just d') (head n_n) rcrd
+        rcrdUpdate (DepFun _ _ body) d' 1 = do
+          d3 <- depsExpBase body
+          rcrdUpdate d3 d' 1
+          {- If the function has arguments, it becomes an AppExp containing a
+            RecordUpdate instead, which is why this (^) is correct even though
+            it seems odd. -}
+        rcrdUpdate _ d' names = failure $ "Record update error: " <>
+                            (show d') <> "\ton fields\t" <> (show names)
 depsExpBase (OpSection qn _ _) = do
   env <- askEnv
   envLookup (qualLeaf qn) env
@@ -344,6 +351,19 @@ depsFieldBase (RecordFieldImplicit (L _ vn) _ _) = do
   env <- askEnv
   envLookup vn env
 
+logDep :: DepVal -> NestedName -> EvalM () -- OBS
+logDep d (Name vn) = depsLog $ envSinglePure vn $ DepVal $ depValDeps d
+logDep (DepGroup _ r1) (RecordName r2) = do
+  let (_, tpl1) = unzip $ TPL.sortFields r1 -- OBS does not check if names match
+      (_, tpl2) = unzip $ TPL.sortFields r2
+    in do
+      _ <- zipWithM logDep tpl1 tpl2
+      pure () 
+  -- logDep (snd a) (snd c) -- OBS loop.fut and inner x
+  -- logDep (DepGroup t b) (RecordName d)
+logDep _ WildcardName = pure ()
+logDep a b = failure $ "Failed to log an inner dependence between " <> show b <> " and " <> show a 
+
 -- | Finds dependencies in application expression bases
 depsAppExpBase :: AppExpBase Info VName -> EvalM DepVal
 depsAppExpBase (Apply eb lst _) = do
@@ -360,24 +380,18 @@ depsAppExpBase (Range eb1 maybe_eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
   pure $ d1 `depValJoin` d2
-depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
+depsAppExpBase (LetPat sb_n pb eb1 eb2 _) = do
+  d0 <- depsSizeBinderList sb_n
   d1 <- depsExpBase eb1
   env <- askEnv
   let name = extractPatBaseName pb
     in do 
-      log' d1 name
+      logDep d1 name
       env' <- case envExtend (Just name) d1 env of
         (Left e) -> failure e
         (Right e) -> pure e
-      localEnv (const env') $ depsExpBase eb2
-      where log' :: DepVal -> NestedVName -> EvalM ()
-            log' d (Name vn) = depsLog $ envSinglePure vn $ DepVal $ depValDeps d
-            log' _ (RecordName []) = pure ()
-            log' (DepGroup t (a:b)) (RecordName (c:d)) = do
-              log' (snd a) (snd c) -- OBS
-              log' (DepGroup t b) (RecordName d)
-            log' _ WildcardName = pure ()
-            log' a b = failure $ "Failed to log an inner dependence between " <> show b <> " and " <> show a 
+      d2 <- localEnv (const env') $ depsExpBase eb2
+      pure $ d0 `depValJoin` d2
 depsAppExpBase (LetFun _ _ _ _) = pure $ DepVal mempty -- OBS
 depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
@@ -409,13 +423,13 @@ depsAppExpBase (Loop _ pb lib lfb eb  _) =
           d2 <- localEnv (const loop_env) $ depsExpBase eb'
           d3 <- loop vn Nothing d1
           pure $ depValDeps d2 `depValInj` d3
-      where loop :: NestedVName -> Maybe NestedVName -> DepVal -> EvalM DepVal
+      where loop :: NestedName -> Maybe NestedName -> DepVal -> EvalM DepVal
             loop p i ld = do
                   env  <- askEnv
                   env' <- case (envSingle i (DepVal mempty), envSingle (Just p) ld) of
                             (Left e, _) -> failure e
                             (_, Left e) -> failure e
-                            (Right env1, Right env2) -> pure $ env <> env1 <> env2
+                            (Right env1, Right env2) -> pure $ env <> env1 <> env2 -- OBS env 2 first, maybe make recursive instead
                   ld' <- localEnv (const env') (depsExpBase eb)
                   if ld == ld'
                     then pure ld'
@@ -437,6 +451,12 @@ depsAppExpBase (Match eb ne_cb _) = do
   pure $ foldr depValJoin (DepVal mempty) $ map (\x -> depValInj (depValDeps x) d1) d_n
   -- OBS use of injection (might need to be removed)
 
+depsSizeBinderList :: [SizeBinder VName] -> EvalM DepVal
+depsSizeBinderList sb_n = do
+  env <- askEnv
+  d_n <- mapM (\x -> envLookup (sizeName x) env) sb_n
+  pure $ foldr depValJoin (DepVal mempty) d_n
+
 -- | Finds dependencies in case bases
 depsCaseBase :: CaseBase Info VName -> EvalM DepVal
 depsCaseBase (CasePat pb eb _) = do 
@@ -457,7 +477,7 @@ depsDimIndexBase (DimSlice maybe_eb1 maybe_eb2 maybe_eb3) = do
 depsPatBase :: PatBase Info VName t -> EvalM DepVal
 depsPatBase (TuplePat pb_n _) = do
   d_n <- mapM depsPatBase pb_n
-  pure $ DepGroup DepTuple $ createRecordTuple d_n 
+  pure $ DepGroup DepTuple $ TPL.tupleFields d_n 
 depsPatBase (RecordPat rcrd _) = do
   d_n <- mapM (depsPatBase . snd) rcrd
   pure $ foldr depValJoin (DepVal mempty) d_n
@@ -482,7 +502,7 @@ depsTypeExp (TEVar qn _) = do
 depsTypeExp (TEParens te _) = depsTypeExp te
 depsTypeExp (TETuple te_n _) = do
   d_n <- mapM depsTypeExp te_n
-  pure $ DepGroup DepTuple $ createRecordTuple d_n
+  pure $ DepGroup DepTuple $ TPL.tupleFields d_n
 depsTypeExp (TERecord lst _) = do
   d_n <- mapM (depsTypeExp . snd) lst
   pure $ foldr depValJoin (DepVal mempty) d_n
