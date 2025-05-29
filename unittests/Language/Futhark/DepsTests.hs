@@ -3,114 +3,122 @@ module Language.Futhark.DepsTests (tests) where
 import Language.Futhark.Deps
 import Test.Tasty
 import Test.Tasty.HUnit
-import Language.Futhark.Syntax
-import Data.Char (ord) 
+import Language.Futhark
+import Data.Map qualified as M
+import Futhark.Compiler
+import System.IO
+import System.IO.Temp
+import Data.List (sort, sortOn)
 
--- | Generates a very simple Var expression for testing 
-generateVar :: Char -> ExpBase Info VName
-generateVar name =
-  Var 
-    (QualName {qualQuals = [], qualLeaf = VName (nameFromString [name]) (ord name)})
-    (Info {unInfo = Scalar (Prim (Signed Int32))})
-    noLoc
+type Error = String
 
--- | Shorthand for creating a literal that isn't bound to a variable
-getLit :: ExpBase Info VName 
-getLit = Literal (SignedValue $ Int8Value 0) noLoc
+-- | Data type for testing
+-- Exists so that we may avoid comparing actual VNames and instead just strings
+data DepValTest
+  = DepValT [String]
+  | DepGroupT [(String, DepValTest)]
+  | DepFunT [(String, DepValTest)] [NestedName]
+  deriving (Eq, Show)
 
--- | Extracts the variable name from a simple variable expression
-getVName :: ExpBase Info VName -> VName
-getVName (Var qn _ _) = qualLeaf qn
-getVName _ = VName (nameFromString "Error") 0
+-- | Converts DepVal into its testing counterpart
+stripDepVal :: DepVal -> DepValTest
+stripDepVal (DepVal (Ids deps)) = DepValT $ sort $ map (\(VName x _) -> nameToString x) deps
+stripDepVal (DepGroup _ rcrd) =
+  DepGroupT $ sortOn fst $ map (\(x, y) -> (nameToString x, stripDepVal y)) $ M.toList rcrd
+stripDepVal (DepFun env names _) = DepFunT (stripEnv env) names
 
--- | Shorthand for some bogus Info that is not applied in the interpreter
-getStructType :: TypeBase dim u
-getStructType = Scalar (Prim Bool)
+-- | Converts InnerDepVals into its testing counterpart
+stripEnv :: InnerDepVals -> [(String, DepValTest)]
+stripEnv (Env deps) = sortOn fst $ map (\((VName x _), y) -> (nameToString x, stripDepVal y)) $ M.toList deps
 
--- | Shorthand for some bogus Info that is not applied in the interpreter
-getInfo :: Info (TypeBase dim u)
-getInfo = Info {unInfo = Scalar (Prim (Signed Int32))}
+-- | Transforms general results from 
+transformDeps :: [(Either Error (BoundDepVal, InnerDepVals))] -> [(Either Error (String, DepValTest))]
+transformDeps [] = []
+transformDeps ((Right (Depends (VName name _) d, env)):t) =
+  [Right (nameToString name, stripDepVal d)] ++ (map Right $ stripEnv env) ++ (transformDeps t)
+transformDeps ((Right (None (Just d), env)):t) =
+  [Right ("", stripDepVal d)] ++ (map Right $ stripEnv env) ++ (transformDeps t)
+transformDeps ((Right (None Nothing, env)):t) =
+  (map Right $ stripEnv env) ++ (transformDeps t)
+transformDeps ((Left e):t) = [Left e] ++ (transformDeps t)
 
--- | Shorthand for some bogus Info that is not applied in the interpreter
-getAppResInfo :: Info AppRes 
-getAppResInfo = (Info {unInfo = AppRes {appResType = getStructType, appResExt = []}})
+-- | Tests a program written in a string
+testWithTempFile :: String -> [(Either Error (String, DepValTest))] -> FilePath -> Handle -> IO ()
+testWithTempFile content correct file h = do
+    hPutStr h content
+    hClose h
+    (_, imports, _) <- readProgramOrDie file
+    let res = (testDeps . fileProg . snd . last) imports
+      in correct @=? transformDeps res
 
--- | Shorthand for some bogus Info that is not applied in the interpreter
-getIdentBase :: ExpBase Info VName -> IdentBase Info VName (TypeBase dim6 u2)
-getIdentBase e = Ident {identName = getVName e, identType = Info {unInfo = Scalar (Prim (Signed Int32))}, identSrcLoc = noLoc}
+-- | Executes a unit test
+unitDepTest :: String -> [(Either Error (String, DepValTest))] -> IO () 
+unitDepTest prog_str correct =
+  withSystemTempFile "test.fut" $ testWithTempFile prog_str correct
 
 tests :: TestTree
 tests =
   testGroup
     "Dependencies"
     [ 
-      {- 
-          if c
-            then (x, z)
-            else (y, z)
-      -}
-      testCase "Injection into tuples" $
-        let c = generateVar 'c'
-            x = generateVar 'x'
-            y = generateVar 'y'
-            z = generateVar 'z'
-        in 
-          depsTestExp
-            (AppExp 
-              (If c
-                (TupLit [x, z] noLoc)
-                (TupLit [y, getLit] noLoc) noLoc)
-              getAppResInfo)
-          @?= Right ( 
-            DepTuple [ -- Outer deps
-              DepVal (Ids [getVName c, getVName x, getVName y]),
-              DepVal (Ids [getVName c, getVName z])],
-            []), -- Inner deps, none because there is no let-binding
+      testCase "Inner empty binding" $
+        unitDepTest "def f = let a = 3 in a"
+          [Left "Does not support analysis of OpenDec"
+          ,Right ("f", DepValT [])
+          ,Right ("a", DepValT [])],
 
-      {- Fixed point test corresponding to the code:  
-          let x = 
-            loop p = (a, b, c) for i < n do
-              (p.1, p.2, p.0)
-          in x.0
-        -}
+      testCase "Inner tuple binding" $
+        unitDepTest "def f2 a = (a, 42) \
+                    \\ndef f1 arg = f2 arg"
+          [Left "Does not support analysis of OpenDec",
+          Right ("f2", DepGroupT [("0", DepValT ["a"]), ("1", DepValT [])]),
+          Right ("f1", DepGroupT [("0", DepValT ["arg"]), ("1", DepValT [])])],
+
+      testCase "Conditional tuple in function call" $
+        unitDepTest "def f2 a b = \
+                      \\n   let c = if b > 0 \
+                      \\n       then (0, a) \
+                      \\n       else (b, b) \
+                      \\n   in c \
+                      \\ndef f1 arg = f2 arg 6"
+          [Left "Does not support analysis of OpenDec"
+          ,Right ("f2",DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
+          ,Right ("c" ,DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
+          ,Right ("f1",DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])
+          ,Right ("c" ,DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])],
+          -- OBS, logs c again since it logged when analyzing f1
+
       testCase "Fixed point iteration in loop" $
-        let x = generateVar 'x'
-            p = generateVar 'p'
-            a = generateVar 'a'
-            b = generateVar 'b'
-            c = generateVar 'c'
-            i = generateVar 'i'
-            n = generateVar 'n'
-        in
-          depsTestExp
-            (AppExp 
-              (LetPat
-                []
-                (Id (getVName x) getInfo noLoc)
-                (AppExp 
-                  (Loop []
-                    (Id (getVName p) getInfo noLoc) 
-                    (LoopInitExplicit (TupLit [a, b, c] noLoc))
-                    (For (getIdentBase i) n)
-                    (TupLit [ -- Cycles tuple
-                        Project (nameFromString "1") p getInfo noLoc, 
-                        Project (nameFromString "2") p getInfo noLoc,
-                        Project (nameFromString "0") p getInfo noLoc
-                        ] noLoc)
-                    noLoc)
-                  getAppResInfo)
-                (Project (nameFromString "0") x getInfo noLoc)
-                noLoc
-              )
-              getAppResInfo)
-            @?= Right (
-                -- Outer deps, the getInfotion depends on all variables except i, p, and x
-                DepVal (Ids [getVName a, getVName b, getVName c, getVName n]),
-                -- Inner deps, x depends on all variables except i, p, and x for all three values in it's tuple
-                -- (because of the variables were cycled in the loop)
-                [ Depends (Name $ getVName x) 
-                  (DepTuple[ DepVal (Ids [getVName a, getVName b, getVName c, getVName n]),
-                            DepVal (Ids [getVName a, getVName b, getVName c, getVName n]),
-                            DepVal (Ids [getVName a, getVName b, getVName c, getVName n])])])
-    ]
+        unitDepTest "def f (x0 : i32) (x1 : i32) (x2 : i32) (n : i32) = \
+                     \\n  let x = \
+                     \\n      loop acc = (x0, x1, x2) for i < n do \
+                     \\n          (acc.1, acc.2, acc.0) \
+                     \\n  in x.0"
+          [Left "Does not support analysis of OpenDec"
+          ,Right ("f",DepValT ["n", "x0", "x1", "x2"])
+          ,Right ("x",DepGroupT [("0", DepValT ["n", "x0", "x1", "x2"]),
+                                 ("1", DepValT ["n", "x0", "x1", "x2"]),
+                                 ("2", DepValT ["n", "x0", "x1", "x2"])])],
+                                 
+      testCase "Free variables in core Futhark functions" $ 
+        unitDepTest "def f1 (y : i64) (xs : [4]i64) = \
+                     \\n  let f2 x = i64.sum (iota (x + y)) \
+                     \\n  in map f2 xs"
+          [Left "Does not support analysis of OpenDec"
+          ,Right ("f1",DepValT ["+","iota","sum","xs","y"])
+          ,Right ("f2",DepValT ["+","iota","sum","x","y"])],
+          -- A lot of "extra" dependencies that does not actually exist are also logged since they are "free variables"
+          -- Working on fixing this...
 
+      testCase "Records" $
+        unitDepTest "def a_record (a : i32) = \
+                     \\n  {foo = 0, bar = true} with foo = a \
+                     \\ndef f (c : bool) (i : i32) = \
+                     \\n    if c \
+                     \\n        then a_record i \
+                     \\n        else {foo = 2, bar = c}"
+          [Left "Does not support analysis of OpenDec"
+          ,Right ("a_record",DepGroupT [("bar",DepValT []),("foo",DepValT ["a"])])
+          ,Right ("f", DepGroupT [("bar", DepValT ["c"]), ("foo", DepValT ["c", "i"])])]
+
+    ]

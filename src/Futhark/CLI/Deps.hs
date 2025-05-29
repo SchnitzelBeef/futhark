@@ -12,6 +12,6 @@ main = mainWithOptions () [] "program" $ \args () ->
     [file] -> do
       Just $ do
         (_, imports, _) <- readProgramOrDie file
-        _ <- mapM (putStrLn . deps . fileProg . snd) $ imports
+        _ <- mapM (putStrLn . runDeps . fileProg . snd) $ imports
         pure()
     _ -> Nothing
