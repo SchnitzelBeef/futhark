@@ -14,18 +14,21 @@ type Error = String
 
 -- | Data type for testing
 -- Exists so that we may avoid comparing actual VNames and instead just strings
+-- since we can prove that all variables are unique in our tests
 data DepValTest
   = DepValT [String]
   | DepGroupT [(String, DepValTest)]
-  | DepFunT [(String, DepValTest)] [NestedName]
+  | DepFunT [(String, DepValTest)] [NestedName] [String]
   deriving (Eq, Show)
 
 -- | Converts DepVal into its testing counterpart
 stripDepVal :: DepVal -> DepValTest
-stripDepVal (DepVal (Ids deps)) = DepValT $ sort $ map (\(VName x _) -> nameToString x) deps
+stripDepVal (DepVal (Ids deps)) =
+  DepValT $ sort $ map (\(VName x _) -> nameToString x) deps
 stripDepVal (DepGroup _ rcrd) =
   DepGroupT $ sortOn fst $ map (\(x, y) -> (nameToString x, stripDepVal y)) $ M.toList rcrd
-stripDepVal (DepFun env names _) = DepFunT (stripEnv env) names
+stripDepVal (DepFun env names _ (Ids deps)) =
+  DepFunT (stripEnv env) names $ sort $ map (\(VName x _) -> nameToString x) deps
 
 -- | Converts InnerDepVals into its testing counterpart
 stripEnv :: InnerDepVals -> [(String, DepValTest)]
@@ -48,7 +51,9 @@ testWithTempFile content correct file h = do
     hPutStr h content
     hClose h
     (_, imports, _) <- readProgramOrDie file
-    let res = (testDeps . fileProg . snd . last) imports
+    -- We only observe the tail of the last output since this corresponds to the
+    -- dependencies of the actual script (without OpenDec)
+    let res = tail $ last $ testDeps $ map (fileProg . snd) imports
       in correct @=? transformDeps res
 
 -- | Executes a unit test
@@ -63,16 +68,14 @@ tests =
     [ 
       testCase "Inner empty binding" $
         unitDepTest "def f = let a = 3 in a"
-          [Left "Does not support analysis of OpenDec"
-          ,Right ("f", DepValT [])
+          [Right ("f", DepValT [])
           ,Right ("a", DepValT [])],
 
       testCase "Inner tuple binding" $
         unitDepTest "def f2 a = (a, 42) \
                     \\ndef f1 arg = f2 arg"
-          [Left "Does not support analysis of OpenDec",
-          Right ("f2", DepGroupT [("0", DepValT ["a"]), ("1", DepValT [])]),
-          Right ("f1", DepGroupT [("0", DepValT ["arg"]), ("1", DepValT [])])],
+          [Right ("f2", DepGroupT [("0", DepValT ["a"]), ("1", DepValT [])])
+          ,Right ("f1", DepGroupT [("0", DepValT ["arg"]), ("1", DepValT [])])],
 
       testCase "Conditional tuple in function call" $
         unitDepTest "def f2 a b = \
@@ -81,8 +84,7 @@ tests =
                       \\n       else (b, b) \
                       \\n   in c \
                       \\ndef f1 arg = f2 arg 6"
-          [Left "Does not support analysis of OpenDec"
-          ,Right ("f2",DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
+          [Right ("f2",DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
           ,Right ("c" ,DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
           ,Right ("f1",DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])
           ,Right ("c" ,DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])],
@@ -94,8 +96,7 @@ tests =
                      \\n      loop acc = (x0, x1, x2) for i < n do \
                      \\n          (acc.1, acc.2, acc.0) \
                      \\n  in x.0"
-          [Left "Does not support analysis of OpenDec"
-          ,Right ("f",DepValT ["n", "x0", "x1", "x2"])
+          [Right ("f",DepValT ["n", "x0", "x1", "x2"])
           ,Right ("x",DepGroupT [("0", DepValT ["n", "x0", "x1", "x2"]),
                                  ("1", DepValT ["n", "x0", "x1", "x2"]),
                                  ("2", DepValT ["n", "x0", "x1", "x2"])])],
@@ -104,8 +105,7 @@ tests =
         unitDepTest "def f1 (y : i64) (xs : [4]i64) = \
                      \\n  let f2 x = i64.sum (iota (x + y)) \
                      \\n  in map f2 xs"
-          [Left "Does not support analysis of OpenDec"
-          ,Right ("f1",DepValT ["+","iota","sum","xs","y"])
+          [Right ("f1",DepValT ["+","iota","sum","xs","y"])
           ,Right ("f2",DepValT ["+","iota","sum","x","y"])],
           -- A lot of "extra" dependencies that does not actually exist are also logged since they are "free variables"
           -- Working on fixing this...
@@ -117,8 +117,7 @@ tests =
                      \\n    if c \
                      \\n        then a_record i \
                      \\n        else {foo = 2, bar = c}"
-          [Left "Does not support analysis of OpenDec"
-          ,Right ("a_record",DepGroupT [("bar",DepValT []),("foo",DepValT ["a"])])
+          [Right ("a_record",DepGroupT [("bar",DepValT []),("foo",DepValT ["a"])])
           ,Right ("f", DepGroupT [("bar", DepValT ["c"]), ("foo", DepValT ["c", "i"])])]
 
     ]

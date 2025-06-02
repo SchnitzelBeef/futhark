@@ -1,3 +1,5 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- | Finds dependencies between variables in programs
 module Language.Futhark.Deps
   ( runDeps,
@@ -42,7 +44,7 @@ data Struct = DepRecord | DepTuple
 data DepVal
   = DepVal Deps
   | DepGroup Struct (M.Map Name DepVal)
-  | DepFun DepsEnv [NestedName] (ExpBase Info VName)
+  | DepFun DepsEnv [NestedName] (ExpBase Info VName) Deps
   deriving (Eq, Show)
 
 data BoundDepVal
@@ -194,7 +196,8 @@ idsWithout x (Ids xs) = Ids $ filter (/=x) xs
 depValDeps :: DepVal -> Deps
 depValDeps (DepVal x) = x
 depValDeps (DepGroup _ x) = foldMap (depValDeps . snd) $ TPL.sortFields x
-depValDeps (DepFun _ lst eb) = foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedNameDeps lst
+depValDeps (DepFun _ lst eb f_deps) =
+  f_deps <> (foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedNameDeps lst)
   where nestedNameDeps :: NestedName -> [VName]
         nestedNameDeps (Name vn) = [vn]
         nestedNameDeps (RecordName x) = concat $ map (nestedNameDeps . snd) $ M.toList x
@@ -212,12 +215,13 @@ depValJoin x@(DepGroup t r1) y@(DepGroup _ r2) =
         else DepVal $ depValDeps x <> depValDeps y
 depValJoin x y = DepVal $ depValDeps x <> depValDeps y
 
--- | Injects dependencies into expressions which is useful in conditionals
+-- | Injects dependencies into expressions
 depValInj :: Deps -> DepVal -> DepVal
 depValInj x (DepVal y) = DepVal $ x <> y
 depValInj x (DepGroup t r) = 
   let (names, tpl) = unzip $ TPL.sortFields r
     in DepGroup t $ M.fromList $ zip names $ map (depValInj x) tpl
+depValInj x (DepFun env par body deps) = DepFun env par body (deps <> x) 
 depValInj x v = DepVal $ x <> depValDeps v
 
 -- | Locates free variables in the body of ProgBase
@@ -329,9 +333,9 @@ depsExpBase (RecordUpdate eb1 n_n eb2 _ _) = do
   where rcrdUpdate :: DepVal -> DepVal -> Int -> InterpretM DepVal
         rcrdUpdate (DepGroup t rcrd) d' 1 | isJust $ M.lookup (head n_n) rcrd = do -- OBS use envLookup instead
           pure $ DepGroup t $ M.update (\_ -> Just d') (head n_n) rcrd
-        rcrdUpdate (DepFun _ _ body) d' 1 = do
+        rcrdUpdate (DepFun _ _ body f_deps) d' 1 = do
           d3 <- depsExpBase body
-          rcrdUpdate d3 d' 1
+          rcrdUpdate (f_deps `depValInj` d3) d' 1 
           {- If the function has arguments, it becomes an AppExp containing a
             RecordUpdate instead, which is why this (^) is correct even though
             it seems odd. -}
@@ -359,7 +363,7 @@ depsExpBase (Coerce eb _ _ _) = depsExpBase eb
 depsExpBase (Lambda pb_n eb _ _ _) = do
   env <- askEnv
   let names = map extractPatBaseName pb_n
-    in pure $ DepFun env names eb
+    in pure $ DepFun env names eb mempty
 depsExpBase (AppExp aeb _) = depsAppExpBase aeb
 
 -- | Finds dependencies in field bases
@@ -375,17 +379,17 @@ depsAppExpBase (Apply eb lst _) = do
   d1 <- depsExpBase eb
   d_n <- mapM depsExpBase $ map snd $ NE.toList lst
   case d1 of 
-    DepFun env' n_n body -> do
+    DepFun env' n_n body f_deps -> do
       fun_env <- case foldr envUnionError (Right env') $ zipWith envSingle (map Just n_n) d_n of
                   Left e -> failure e
                   Right e -> pure e 
-      localEnv (const fun_env) $ depsExpBase body
+      d2 <- localEnv (const fun_env) $ depsExpBase body
+      pure $ f_deps `depValInj` d2 
     {- Meeting a function that it does not know, it is simply a conservative 
        estimate that it uses all the free variables inside the expression, which
        are uncovered through depValJoin  
       -}
-    _ -> pure $ foldr (\elm acc -> acc <> (DepVal $ depValDeps elm))
-                        (DepVal $ depValDeps d1) d_n
+    _ -> pure $ foldr depValJoin d1 d_n
 depsAppExpBase (Range eb1 maybe_eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
@@ -402,9 +406,8 @@ depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
       localEnv (const env') $ depsExpBase eb2
 depsAppExpBase (LetFun vn (_, pb_n, _, _, eb1) eb2 _ ) = do
   env <- askEnv
-  let fun = DepFun env (map extractPatBaseName pb_n) eb1
+  let fun = DepFun env (map extractPatBaseName pb_n) eb1 mempty
     in do
-      argDeps <- mapM depsPatBase pb_n
       logDep (DepVal $ Ids $ freeVarsList eb1) $ Name vn
       env' <- pure $ envExtendPure vn fun env
       localEnv (const env') $ depsExpBase eb2
@@ -559,13 +562,13 @@ logDep a b = failure $ "Failed to log an inner dependence between " <> show b <>
 -- Finds the relation between the name and the explicit ExpBase definition i a DecBase
 bindingInDecBase :: DecBase Info VName -> BoundDepVal
 bindingInDecBase (ValDec bind) = 
-  let func = DepFun mempty (map extractPatBaseName $ valBindParams bind) $ valBindBody bind
+  let func = DepFun mempty (map extractPatBaseName $ valBindParams bind) (valBindBody bind) mempty
     in Depends (valBindName bind) func
 bindingInDecBase (LocalDec db _) = bindingInDecBase db 
 bindingInDecBase _ = None Nothing
 
 -- | Interpretation function for dependencies
-deps :: DepsEnv -> Prog -> [(Either Error (BoundDepVal, InnerDepVals))]
+deps :: DepsEnv -> Prog -> [Either Error (BoundDepVal, InnerDepVals)]
 deps env prog = 
   let bindings = map bindingInDecBase $ progDecs prog
       env' = foldMap joinBindings bindings -- A two pass scan*
@@ -573,28 +576,43 @@ deps env prog =
               joinBindings (Depends vn d) = envSinglePure vn d
               joinBindings _ = mempty 
   in map repack $ zip bindings $ map (logDepsM (env' <> env) . depsDecBase) $ progDecs prog
-        where repack :: (BoundDepVal, (Either Error DepVal, InnerDepVals)) -> (Either Error (BoundDepVal, InnerDepVals))
+        where repack :: (BoundDepVal, (Either Error DepVal, InnerDepVals)) -> Either Error (BoundDepVal, InnerDepVals)
               repack (Depends vn _, (Right d2, d3)) = Right (Depends vn d2, d3)
               repack (None _, (Right d2, d3)) = Right (None (Just d2), d3)
               repack (Depends vn _, (Left e, _)) = Left $ "In function" ++ show vn ++ "\n" ++ e
               repack (None _, (Left e, _)) = Left e
 -- *Turns out this is unnecessary since Futhark doesn't do support functions defined later in the program :-)  
 
+joinDeps :: [Either Error (BoundDepVal, InnerDepVals)] -> DepsEnv
+joinDeps [] = mempty
+joinDeps (Right (Depends vn d, d_n):t) = envExtendPure vn d d_n <> joinDeps t
+joinDeps (_:t) = joinDeps t
+
+prettyPrinter :: Either Error (BoundDepVal, InnerDepVals) -> String -> String
+prettyPrinter (Right (bound, Env d_n)) acc =
+          "\n\ESC[0mFunction: \ESC[95m" ++ show bound ++
+          "\n\ESC[0m\tInner dependencies: \ESC[36m" ++ 
+          (foldr (\(k, a) x -> x ++ "\n\t\t" ++ show k ++ " depends on " ++ show a) "" $ M.toList d_n)
+          ++ "\ESC[0m\n" ++ acc 
+prettyPrinter (Left e) acc =
+          "\n\ESC[31mError in dependency interpreter in function: \ESC[95m" ++ show e ++ acc
+
+
+depsFolder :: forall a . ([Either Error (BoundDepVal, InnerDepVals)] -> a -> a) -> a -> [Prog] -> a
+depsFolder printer base progs = 
+  snd $ foldr depsFolder' (mempty, base) progs
+        where depsFolder' :: Prog -> (DepsEnv, a) -> (DepsEnv, a) 
+              depsFolder' p (env, s) =
+                let either_d = deps (env <> depsFreeVarsInProgBase p) p
+                  in (joinDeps either_d <> env, printer either_d s)
+ 
 -- | Finds dependencies in a program
-runDeps :: Prog -> String
-runDeps prog = foldr concatDeps "" $ deps (depsFreeVarsInProgBase prog) prog
-  where concatDeps :: (Either Error (BoundDepVal, InnerDepVals)) -> String -> String
-        concatDeps (Right (bound, Env d_n)) acc =
-                  "\n\ESC[0mFunction: \ESC[95m" ++ show bound ++
-                  "\n\ESC[0m\tInner dependencies: \ESC[36m" ++ 
-                  (foldr (\(k, a) x -> x ++ "\n\t\t" ++ show k ++ " depends on " ++ show a) "" $ M.toList d_n)
-                  ++ "\ESC[0m\n" ++ acc 
-        concatDeps (Left e) acc =
-                  "\ESC[31mError in dependency interpreter in function: \ESC[95m" ++ show e ++ acc
+runDeps :: [Prog] -> String
+runDeps progs = depsFolder (\d s -> foldr prettyPrinter s d) "" progs
 
 -- | Tester function for dependencies
-testDeps :: Prog -> [(Either Error (BoundDepVal, InnerDepVals))]
-testDeps prog = deps (depsFreeVarsInProgBase prog) prog
+testDeps :: [Prog] -> [[Either Error (BoundDepVal, InnerDepVals)]]
+testDeps progs = depsFolder (\d s -> [d] ++ s) [] progs
 
 -- | Function for unit-testing specific parts of the ast
 -- depsTestExp :: ExpBase Info VName -> Either Error (DepVal, DepsEnv) 
