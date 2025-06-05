@@ -113,10 +113,10 @@ tests =
         unitDepTest "def f1 (y : i64) (xs : [4]i64) = \
                      \\n  let f2 x = i64.sum (iota (x + y)) \
                      \\n  in map f2 xs"
-          [Right (["f1"],DepValT ["+","iota","sum","xs","y"])
-          ,Right (["f1", "f2"],DepValT ["+","iota","sum","x","y"])],
-          -- A lot of "extra" dependencies that does not actually exist are also logged since they are "free variables"
-          -- Working on fixing this...
+          [Right (["f1"],DepValT ["xs","y"])
+          ,Right (["f1", "f2"],DepValT ["+","iota","sum", "x","y"])],
+          -- Currently i64.sum is not supported (because it is under TypeDec)
+          -- which results in a base-case which is simply the free variables of the expression
 
       testCase "Records in conditional" $
         unitDepTest "def a_record (a : i32) = \
@@ -198,6 +198,6 @@ tests =
         unitDepTest "def f2 (x : i32) (y : i32) = x + y \
                      \\ndef f1 (a : i32) (b : i32) (c : i32) = (f2 a) (b `f2` c)"
           [Right (["f2"], DepValT ["x", "y"])
-          ,Right (["f1"], DepValT ["+", "a", "b", "c"])]
+          ,Right (["f1"], DepValT ["a", "b", "c"])]
 
     ]

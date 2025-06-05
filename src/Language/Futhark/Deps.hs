@@ -8,8 +8,8 @@ module Language.Futhark.Deps
     BoundDepVal (..),
     NestedName (..),
     InnerDepVals,
+    DepsEnv,
     StackTrace (..),
-    DepsEnv (..),
     Env (..),
     Ids (..)
   )
@@ -100,7 +100,7 @@ instance (Functor e) => Monad (Free e) where
 
 -- The different operations the interpreter can do in a monadic context
 data InterpretOp a
-  = LogOp (StackTrace, VName, DepVal) a
+  = LogOp (StackTrace, VName, DepVal) a -- OBS: Remove a
   | ReadOp ((DepsEnv, StackTrace) -> a)  
   | ErrorOp Error
 
@@ -133,9 +133,6 @@ failure = Free . ErrorOp
 depsEnvSingle :: Maybe NestedName -> DepVal -> Either Error (DepsEnv, StackTrace)
 depsEnvSingle names d = depsEnvExtend names d depsEnvEmpty
 
-depsEnvSinglePure :: VName -> DepVal -> (DepsEnv, StackTrace)
-depsEnvSinglePure vn d = (Env $ M.singleton vn d, emptyStack)
-
 depsEnvExtend :: Maybe NestedName -> DepVal -> (DepsEnv, StackTrace) -> Either Error (DepsEnv, StackTrace)
 depsEnvExtend (Just (Name vn)) d (Env env, st) = Right $ (Env $ M.insert vn d env, st)
 depsEnvExtend (Just (RecordName r1)) (DepGroup _ r2) env
@@ -166,7 +163,7 @@ envUnionError :: Either Error (DepsEnv, StackTrace)
 envUnionError (Left e) _ = Left e
 envUnionError  _ (Left e) = Left e
 envUnionError (Right (Env env1, _)) (Right (Env env2, _)) =
-  Right (Env $ env1 <> env2, emptyStack)
+  Right (Env $ env2 <> env1, emptyStack)
 
 envLookup :: VName -> (DepsEnv, StackTrace) -> InterpretM DepVal
 envLookup vn ((Env env, _)) = do
@@ -199,13 +196,6 @@ merge (x:xs) (y:ys)
   | x > y  = y : merge (x:xs) ys
   | otherwise = x : merge xs ys
 
-instance Semigroup DepVal where 
-  (<>) = depValJoin
-
-instance Monoid DepVal where 
-  mempty = DepVal mempty
-
-
 instance Semigroup Ids where
   Ids x <> Ids y = Ids $ merge x y
 
@@ -229,36 +219,56 @@ idsSingle v = Ids [v]
 idsWithout :: VName -> Ids -> Ids
 idsWithout x (Ids xs) = Ids $ filter (/=x) xs
 
+mergeDepVals :: [Deps] -> Deps
+mergeDepVals dps = foldr (<>) mempty dps 
+
 -- | Extracting pure identifiers from DepVal
-depValDeps :: DepVal -> Deps
-depValDeps (DepVal x) = x
-depValDeps (DepGroup _ x) = foldMap (depValDeps . snd) $ TPL.sortFields x
-depValDeps (DepFun _ _ lst eb) =
-  foldr idsWithout (Ids $ freeVarsList eb) $ concat $ map nestedNameDeps lst
+depValDeps :: DepVal -> InterpretM Deps
+depValDeps (DepVal x) = pure x
+depValDeps (DepGroup _ x) = do
+  dps <- mapM (depValDeps . snd) $ TPL.sortFields x
+  pure $ mergeDepVals dps
+depValDeps (DepFun _ _ lst eb) = do
+  d1 <- depsExpBase eb
+  d2 <- depValDeps d1
+  pure $ foldr idsWithout d2 $ concat $ map nestedNameDeps lst
   where nestedNameDeps :: NestedName -> [VName]
-        nestedNameDeps (Name vn) = [vn]
-        nestedNameDeps (RecordName x) = concat $ map (nestedNameDeps . snd) $ M.toList x
         nestedNameDeps WildcardName = mempty
+        nestedNameDeps (Name vn) = [vn]
+        nestedNameDeps (RecordName x) =
+          concat $ map (nestedNameDeps . snd) $ M.toList x
 
 -- | Joins two different sets of DepVal
 -- Only records of equal length and fields can be joined without collapsing to pure DepVal Deps
-depValJoin :: DepVal -> DepVal -> DepVal
+depValJoin :: DepVal -> DepVal -> InterpretM DepVal
 depValJoin x@(DepGroup t r1) y@(DepGroup _ r2) =
   let (names1, tpl1) = unzip $ TPL.sortFields r1
       (names2, tpl2) = unzip $ TPL.sortFields r2
     in
       if names1 == names2 
-        then DepGroup t $ M.fromList $ zip names1 $ zipWith depValJoin tpl1 tpl2
-        else DepVal $ depValDeps x <> depValDeps y
-depValJoin x y = DepVal $ depValDeps x <> depValDeps y
+        then do
+          d_n <- zipWithM depValJoin tpl1 tpl2
+          pure $ DepGroup t $ M.fromList $ zip names1 d_n
+        else do
+          dps1 <- depValDeps x
+          dps2 <- depValDeps y
+          pure $ DepVal $ dps1 <> dps2 
+depValJoin x y = do
+  dps1 <- depValDeps x
+  dps2 <- depValDeps y
+  pure $ DepVal $ dps1 <> dps2
 
 -- | Injects dependencies into expressions
-depValInj :: Deps -> DepVal -> DepVal
-depValInj x (DepVal y) = DepVal $ x <> y
+depValInj :: Deps -> DepVal -> InterpretM DepVal
+depValInj x (DepVal y) = pure $ DepVal $ x <> y
 depValInj x (DepGroup t r) = 
   let (names, tpl) = unzip $ TPL.sortFields r
-    in DepGroup t $ M.fromList $ zip names $ map (depValInj x) tpl
-depValInj x v = DepVal $ x <> depValDeps v
+    in do
+      dps <- mapM (depValInj x) tpl
+      pure $ DepGroup t $ M.fromList $ zip names dps
+depValInj x v = do
+  dps <- depValDeps v
+  pure $ DepVal $ x <> dps
 
 -- | Locates free variables in the body of ProgBase
 -- OBS: Only handles the last progDecs currently
@@ -322,7 +332,7 @@ depsExpBase (QualParens qn eb _) = do
   env <- askEnv
   d1 <- envLookup (qualLeaf $ fst qn) env
   d2 <- depsExpBase eb
-  pure $ d1 `depValJoin` d2
+  depValJoin d1 d2
 depsExpBase (TupLit ebn _) = do
   d_n <- mapM depsExpBase ebn
   pure $ DepGroup DepTuple $ TPL.tupleFields d_n
@@ -334,7 +344,7 @@ depsExpBase (RecordLit fb_n _) = do
         extractFieldBaseName (RecordFieldImplicit (L _ (VName name _)) _ _) = name
 depsExpBase (ArrayLit eb_n _ _) = do
   d_n <- mapM depsExpBase eb_n
-  pure $ foldr depValJoin mempty d_n
+  foldM depValJoin (DepVal mempty) d_n
 depsExpBase (ArrayVal _ _ _) = pure $ DepVal mempty
 depsExpBase (Attr _ eb _) = depsExpBase eb 
 depsExpBase (Project name eb _ _) = do
@@ -352,15 +362,16 @@ depsExpBase (Not eb _) = depsExpBase eb
 depsExpBase (Assert eb1 eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
-  pure $ d1 <> d2
+  depValJoin d1 d2
 depsExpBase (Constr _ eb_n _ _) = do
   d_n <- mapM depsExpBase eb_n
-  pure $ foldr depValJoin mempty d_n
+  foldM depValJoin (DepVal mempty) d_n
 depsExpBase (Update eb1 sb eb2 _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
+  d3 <- depValJoin d1 d2
   d_n <- depsSliceBase sb
-  pure $ foldr depValJoin (d1 <> d2) d_n
+  foldM depValJoin d3 d_n
 depsExpBase (RecordUpdate eb1 n_n eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
@@ -375,7 +386,7 @@ depsExpBase (RecordUpdate eb1 n_n eb2 _ _) = do
             If the function has arguments, it becomes an AppExp containing a
             RecordUpdate instead, which is why this (^) is correct even though
             it seems odd. -}
-        rcrdUpdate d3 d' _ = pure $ d3 <> d' 
+        rcrdUpdate d3 d' _ = depValJoin d3 d' 
 depsExpBase (OpSection qn _ _) = do
   env <- askEnv
   envLookup (qualLeaf qn) env
@@ -383,16 +394,16 @@ depsExpBase (OpSectionLeft qn _ eb _ _ _) = do
   env <- askEnv
   d0 <- envLookup (qualLeaf qn) env
   d1 <- depsExpBase eb
-  pure $ d0 <> d1
+  depValJoin d0 d1
 depsExpBase (OpSectionRight qn _ eb _ _ _) = do
   env <- askEnv
   d0 <- envLookup (qualLeaf qn) env
   d1 <- depsExpBase eb
-  pure $ d0 `depValJoin` d1
+  depValJoin d0 d1
 depsExpBase (ProjectSection _ _ _) = pure $ DepVal mempty
 depsExpBase (IndexSection sb _ _) = do
   d_n <- depsSliceBase sb
-  pure $ foldr depValJoin mempty d_n
+  foldM depValJoin (DepVal mempty) d_n
 depsExpBase (Ascript eb _ _) = depsExpBase eb
 depsExpBase (Coerce eb _ _ _) = depsExpBase eb 
 depsExpBase (Lambda pb_n eb _ _ _) = do
@@ -415,28 +426,19 @@ depsAppExpBase (Apply eb lst _) = do
   d_n <- mapM depsExpBase $ map snd $ NE.toList lst
   case d1 of 
     DepFun maybe_vn env' n_n body -> do
+      env <- askEnv
       fun_env <-
         case foldr envUnionError (Right (env', emptyStack)) $ zipWith depsEnvSingle (map Just n_n) d_n of
           Left e -> failure e
           Right e -> pure e 
-      env <- askEnv
-      -- failure $ "IN FUNC: " <> (show $ snd env) <> "\n" <> (show maybe_vn) <> "\n body: " <> (show body)
       case (maybe_vn, snd env) of
         (Just vn, st) -> localEnv (const (fst fun_env, addToStack vn st)) $ depsExpBase body
         (Nothing, _) -> localEnv (const fun_env) $ depsExpBase body
-      -- case eb of
-      --   (Var qn _ _) -> InnerStackOP (qualLeaf qn) $
-      
-        -- _ -> localEnv (const fun_env) $ depsExpBase body
-    {- Meeting a function that it does not know, it is simply a conservative 
-      estimate that it uses all the free variables inside the expression, which
-      are uncovered through depValJoin  
-      -}
-    _ -> pure $ foldr depValJoin d1 d_n
+    d2 -> foldM depValJoin d2 d_n  -- foldr depValJoin d1 d_n -- DepVal mempty
 depsAppExpBase (Range eb1 maybe_eb2 _ _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
-  pure $ d1 `depValJoin` d2
+  depValJoin d1 d2
 depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
   env <- askEnv
@@ -459,7 +461,9 @@ depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
   d2 <- depsExpBase eb2
   d3 <- depsExpBase eb3
-  pure $ depValDeps d1 `depValInj` (d2 `depValJoin` d3)
+  d4 <- depValJoin d2 d3
+  d5 <- depValDeps d1
+  depValInj d5 d4
 depsAppExpBase (Loop _ pb lib lfb eb _) = 
   let vn = extractPatBaseName pb
     in do
@@ -474,17 +478,20 @@ depsAppExpBase (Loop _ pb lib lfb eb _) =
         For ib' eb' -> do
           d2 <- localEnv (const loop_env) $ depsExpBase eb'
           d3 <- loop vn (Just $ Name $ identName ib') d1
-          pure $ depValDeps d2 `depValInj` d3
+          d4 <- depValDeps d2
+          depValInj d4 d3
         ForIn pb' eb' ->
           let vn' = Just $ extractPatBaseName pb'
             in do
               d2 <- localEnv (const loop_env) $ depsExpBase eb'
               d3 <- loop vn vn' d1
-              pure $ depValDeps d2 `depValInj` d3
+              d4 <- depValDeps d2
+              depValInj d4 d3
         While eb' -> do
           d2 <- localEnv (const loop_env) $ depsExpBase eb'
           d3 <- loop vn Nothing d1
-          pure $ depValDeps d2 `depValInj` d3
+          d4 <- depValDeps d2
+          depValInj d4 d3
       where loop :: NestedName -> Maybe NestedName -> DepVal -> InterpretM DepVal
             loop p i ld = do
               env  <- askEnv
@@ -495,13 +502,16 @@ depsAppExpBase (Loop _ pb lib lfb eb _) =
               ld' <- localEnv (const env') $ depsExpBase eb
               if ld == ld'
                 then pure ld'
-                else loop p i $ ld <> ld' 
+                else do
+                  d' <- depValJoin ld ld' 
+                  loop p i d'
 depsAppExpBase (BinOp qn _ eb1 eb2 _) = do
   env <- askEnv
   d0 <- envLookup (qualLeaf $ fst qn) env
   d1 <- depsExpBase $ fst eb1
   d2 <- depsExpBase $ fst eb2
-  pure $ d0 <> d1 <> d2
+  d3 <- depValJoin d0 d1
+  depValJoin d2 d3
 depsAppExpBase (LetWith ib1 ib2 sb eb1 eb2 _) = do
   d_n <- depsSliceBase sb
   d1 <- depsExpBase eb1
@@ -510,19 +520,22 @@ depsAppExpBase (LetWith ib1 ib2 sb eb1 eb2 _) = do
   -- indirectly on all the dependencies of the consumed array
   env <- askEnv
   d2 <- envLookup (identName ib2) env
-  logDep (snd env) (d1 <> d2) $ Name $ identName ib1
+  d3 <- depValJoin d1 d2
+  logDep (snd env) d3 $ Name $ identName ib1
   env' <- pure $ depsEnvExtendPure (identName ib1) d1 env
-  inj_deps <- pure $ foldMap depValDeps d_n
+  d4 <- mapM depValDeps d_n
   res <- localEnv (const env') $ depsExpBase eb2
-  pure $ inj_deps `depValInj` res
+  depValInj (mergeDepVals d4) res
 depsAppExpBase (Index eb sb _) = do
   d <- depsExpBase eb 
   d_n <- depsSliceBase sb
-  pure $ foldr depValJoin d d_n 
+  foldM depValJoin d d_n 
 depsAppExpBase (Match eb ne_cb _) = do
   d1 <- depsExpBase eb
+  d2 <- depValDeps d1
   d_n <- mapM depsCaseBase (NE.toList ne_cb)
-  pure $ foldMap (\x -> depValInj (depValDeps d1) x) d_n
+  d_n' <- mapM (depValInj d2) d_n
+  foldM depValJoin (DepVal mempty) d_n'
 
 -- | Finds dependencies in case bases
 depsCaseBase :: CaseBase Info VName -> InterpretM DepVal
@@ -535,7 +548,8 @@ depsDimIndexBase (DimSlice maybe_eb1 maybe_eb2 maybe_eb3) = do
   d1 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
   d3 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb3
-  pure $ d1 `depValJoin` d2 `depValJoin` d3
+  d4 <- depValJoin d1 d2
+  depValJoin d3 d4
 
 -- | Finds dependencies in slice bases
 depsSliceBase :: SliceBase Info VName -> InterpretM [DepVal]
