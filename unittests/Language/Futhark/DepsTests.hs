@@ -18,11 +18,24 @@ type Error = String
 data DepValTest
   = DepValT [String]
   | DepGroupT [(String, DepValTest)]
-  | DepFunT [([String], DepValTest)] [NestedName]
+  | DepFunT [([String], DepValTest)] [NestedNameT]
   deriving (Eq, Show)
 
+data NestedNameT
+  = NameT String
+  | NestedNameT [(String, NestedNameT)]
+  deriving (Eq, Show)
+
+-- | Converts VName to string
 stripVName :: VName -> String
 stripVName (VName x _) = nameToString x
+
+-- | Converts nested names to its testing counterpart
+stripNestedName :: NestedName -> NestedNameT
+stripNestedName (Name vn) = NameT $ stripVName vn
+stripNestedName (RecordName rcrd) =
+  NestedNameT $ map (\(x, y) -> (nameToString x, stripNestedName y)) $ sortOn fst $ M.toList rcrd
+stripNestedName WildcardName = NameT "" 
 
 -- | Converts InnerDepVals into its testing counterpart
 stripEnv :: DepsEnv -> [([String], DepValTest)]
@@ -38,7 +51,7 @@ stripDepVal (DepVal (Ids deps)) =
   DepValT $ sort $ map stripVName deps
 stripDepVal (DepGroup _ rcrd) =
   DepGroupT $ sortOn fst $ map (\(x, y) -> (nameToString x, stripDepVal y)) $ M.toList rcrd
-stripDepVal (DepFun _ env names _) = DepFunT (stripEnv env) names
+stripDepVal (DepFun _ env names _) = DepFunT (stripEnv env) $ map stripNestedName names
 
 -- | Transforms general results 
 transformDeps :: [(Either Error (BoundDepVal, InnerDepVals))] -> [(Either Error ([String], DepValTest))]
@@ -72,7 +85,10 @@ tests =
   testGroup
     "Dependencies"
     [ 
-      -- ========================== Odd-balls/edge cases/comprised tests: ==========================
+      -- ======================= Larger algorithms ============================= 
+      -- (Taken from https://futhark-lang.org/examples.html)
+
+      -- =============== Odd-balls/edge cases/comprised tests: =================
 
       testCase "Inner empty binding" $
         unitDepTest "def f = let a = 3 in a"
@@ -134,10 +150,10 @@ tests =
                      \\n  match a \
                      \\n  case #bool x -> #bool x \
                      \\n  case #tpl (y, z) -> #tpl (y, c + b)"
-          [Left "Could not find name of a top level definition"
+          [Left "Does not support analysis of TypeDec"
           ,Right (["f"],DepValT ["a", "b", "c"])],
 
-      -- ========================== ExpBase tests: ==========================
+      -- ========================== ExpBase tests: =============================
 
       testCase "TupLit" $
         unitDepTest "def f (a : i32) (b : i32) (c : i32) = (a + b, (c, b + 10), 0)"
@@ -198,6 +214,75 @@ tests =
         unitDepTest "def f2 (x : i32) (y : i32) = x + y \
                      \\ndef f1 (a : i32) (b : i32) (c : i32) = (f2 a) (b `f2` c)"
           [Right (["f2"], DepValT ["x", "y"])
-          ,Right (["f1"], DepValT ["a", "b", "c"])]
+          ,Right (["f1"], DepValT ["a", "b", "c"])],
+
+      -- ========================== FieldBase tests: ===========================
+        
+      testCase "RecordFieldExplicit" $
+        unitDepTest "type p = {x : i32, y : i32}\
+                     \\ndef f2 (x' : i32) (y' : i32) : p = {x = x' + y', y = y'} \
+                     \\ndef f1 (a : i32) (b : i32) = \
+                     \\n  let {x, y} = f2 a b \
+                     \\n  in x + y"
+          [Left "Does not support analysis of TypeDec"
+          ,Right (["f2"], DepGroupT [("x", DepValT["x'","y'"]), ("y", DepValT["y'"])])
+          ,Right (["f1"], DepValT ["a", "b"])
+          ,Right (["f1","x"],DepValT ["a", "b"])
+          ,Right (["f1","y"],DepValT ["b"])],
+
+      testCase "RecordFieldImplicit" $
+        unitDepTest "type p = {x : i32, y : i32}\
+                     \\ndef f2 (x' : i32) (y' : i32) : p = {x = x' + y', y = y'} \
+                     \\ndef f1 (a : i32) (b : i32) = \
+                     \\n  let {x = x, y = y} = f2 a b \
+                     \\n  in x + y"
+          [Left "Does not support analysis of TypeDec"
+          ,Right (["f2"], DepGroupT [("x", DepValT["x'", "y'"]), ("y", DepValT["y'"])])
+          ,Right (["f1"], DepValT ["a", "b"])
+          ,Right (["f1","x"],DepValT ["a", "b"])
+          ,Right (["f1","y"],DepValT ["b"])],
+
+      -- ========================== AppExpBase tests: ==========================
+
+          -- Missing apply (both ways)
+
+      testCase "Ranges" $
+        unitDepTest "def f (a : i32) (b : i32) (c : i32) = a..b...c"
+          [Right (["f"], DepValT ["a", "b", "c"])],
+
+      testCase "LetPat 1 (pure)" $
+        unitDepTest "def f (b : i32) = \
+                     \\n  let a = b \
+                     \\n  in b "
+          [Right (["f"], DepValT ["b"])
+          ,Right (["f", "a"], DepValT ["b"])],
+
+      testCase "LetPat 2 (lambda)" $
+        unitDepTest "def f (b : i32) = \
+                     \\n  let a = \\x -> x \
+                     \\n  in a b"
+          [Right (["f"], DepValT ["b"])
+          ,Right (["f","a"], DepFunT [(["b"], DepValT ["b"]),(["f"], DepFunT [] [NameT "b"])] [NameT "x"])],
+
+      testCase "LetPat 3 (function)" $
+        unitDepTest "def f2 (x : i32) =\
+                     \\n  let y = x \ 
+                     \\n  in y \
+                     \\ndef f1 (b : i32) = \
+                     \\n  let a = f2 \
+                     \\n  in a b"
+          [Right (["f2"], DepValT ["x"])
+          ,Right (["f2","y"], DepValT ["x"])
+          ,Right (["f1"], DepValT ["b"])
+          ,Right (["f1","a"], DepFunT [(["f1"], DepFunT [] [NameT "b"])] [NameT "x"])
+          ,Right (["f1","f2","y"], DepValT ["b"])]
+          -- A "fun" thing to note here is that f2 does not store "b" in its domain of the environment
+          -- but in the previous test (LetPat 2 lambda), "b" is a part of the domain
+          -- This is because functions are statically typed
+
+
+      -- ========================== CaseBase tests: ============================
+
+      -- ========================== DimIndexBase tests: ========================
 
     ]

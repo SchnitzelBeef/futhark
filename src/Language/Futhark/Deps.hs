@@ -57,6 +57,8 @@ data DepVal
   | DepGroup Struct (M.Map Name DepVal)
   | DepFun (Maybe VName) DepsEnv [NestedName] (ExpBase Info VName)
   deriving (Eq, Show)
+-- The first (Maybe VName) certainly be omitted, but this is somehow easier
+-- (it is used to track the call stack)
 
 data BoundDepVal
   = Depends VName DepVal
@@ -100,7 +102,7 @@ instance (Functor e) => Monad (Free e) where
 
 -- The different operations the interpreter can do in a monadic context
 data InterpretOp a
-  = LogOp (StackTrace, VName, DepVal) a -- OBS: Remove a
+  = LogOp (StackTrace, VName, DepVal) a
   | ReadOp ((DepsEnv, StackTrace) -> a)  
   | ErrorOp Error
 
@@ -180,10 +182,6 @@ envLookup vn ((Env env, _)) = do
 
 innerDepsExtend :: (StackTrace, VName, DepVal) -> InnerDepVals -> InnerDepVals
 innerDepsExtend (st, vn, d) (Env env) = Env $ M.insert (addToStack vn st) d env
-
-tryInjectFunctionName :: NestedName -> DepVal -> DepVal
-tryInjectFunctionName (Name vn) (DepFun _ env n_n body) = DepFun (Just vn) env n_n body
-tryInjectFunctionName _ d = d
  
 -- | Merges two lists of that have the order instance.
 -- Used when combining two identifier sets which are always ordered
@@ -286,15 +284,22 @@ depsFreeVarsInExpBase eb = Env $ M.fromList $ map (\x -> (x, DepVal mempty)) $ f
 freeVarsList :: ExpBase Info VName -> [VName]
 freeVarsList eb = S.toList $ FV.fvVars $ freeInExp eb
 
--- | Converts pattern bases to pure NestedNames ** UNFINISHED
+-- | Converts pattern bases to pure NestedNames
+-- 
 extractPatBaseName :: PatBase Info VName t -> NestedName
-extractPatBaseName (TuplePat pb_n _) = RecordName $ TPL.tupleFields $ map extractPatBaseName pb_n
-extractPatBaseName (RecordPat npb_n _) = RecordName $ M.fromList $ map (\(L _ x, y) -> (x, extractPatBaseName y)) npb_n
+extractPatBaseName (TuplePat pb_n _) =
+  RecordName $ TPL.tupleFields $ map extractPatBaseName pb_n
+extractPatBaseName (RecordPat npb_n _) =
+  RecordName $ M.fromList $ map (\(L _ x, y) -> (x, extractPatBaseName y)) npb_n
 extractPatBaseName (PatParens pb _) = extractPatBaseName pb
 extractPatBaseName (Id vn _ _) = Name vn
+extractPatBaseName (Wildcard _ _) = WildcardName
 extractPatBaseName (PatAscription pb _ _) = extractPatBaseName pb
-extractPatBaseName _ = WildcardName
--- Missing: PatConst and PatAttr
+extractPatBaseName (PatLit _ _ _) = WildcardName
+extractPatBaseName (PatConstr _ _ pb_n _) =
+  -- This might not be correct:
+  RecordName $ TPL.tupleFields $ map extractPatBaseName pb_n
+extractPatBaseName (PatAttr _ pb _) = extractPatBaseName pb
 
 
 -- | Converts nested names to pure DepsEnv's, should be used with care
@@ -309,7 +314,6 @@ depsDecBase (ValDec bindings) = do
   env <- askEnv
   let env' = foldMap (nestedNamesToSelfEnv . extractPatBaseName) $ valBindParams bindings
     in localEnv (const $ env' <> env) $ depsExpBase $ valBindBody bindings
-    -- ^^ Above line should probably not be used since it may override definitions
 depsDecBase (TypeDec _) = failure "Does not support analysis of TypeDec"
 depsDecBase (ModTypeDec _) = failure "Does not support analysis of ModTypeDec"
 depsDecBase (ModDec _) = failure "Does not support analysis of ModDec"
@@ -434,19 +438,24 @@ depsAppExpBase (Apply eb lst _) = do
       case (maybe_vn, snd env) of
         (Just vn, st) -> localEnv (const (fst fun_env, addToStack vn st)) $ depsExpBase body
         (Nothing, _) -> localEnv (const fun_env) $ depsExpBase body
-    d2 -> foldM depValJoin d2 d_n  -- foldr depValJoin d1 d_n -- DepVal mempty
-depsAppExpBase (Range eb1 maybe_eb2 _ _) = do
+    d2 -> foldM depValJoin d2 d_n
+depsAppExpBase (Range eb1 maybe_eb2 inclusive_eb3 _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ DepVal mempty) depsExpBase maybe_eb2
-  depValJoin d1 d2
+  d3 <-
+    case inclusive_eb3 of
+      (DownToExclusive eb3) -> depsExpBase eb3
+      (ToInclusive eb3) -> depsExpBase eb3
+      (UpToExclusive eb3) -> depsExpBase eb3
+  d4 <- depValJoin d1 d2
+  depValJoin d3 d4
 depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
   env <- askEnv
   let name = extractPatBaseName pb
-      d2 = tryInjectFunctionName name d1 -- In case of lambda in LetPat
     in do
-      logDep (snd env) d2 name 
-      env' <- case depsEnvExtend (Just name) d2 env of
+      logDep (snd env) d1 name 
+      env' <- case depsEnvExtend (Just name) d1 env of
                 (Left e) -> failure e
                 (Right e) -> pure e
       localEnv (const env') $ depsExpBase eb2
@@ -577,10 +586,6 @@ logDep _ _ WildcardName = pure ()
 logDep _ a b = failure $ "Failed to log an inner dependence between " <> show b <>
                          "\tand\t" <> show a 
 
--- innerStack :: VName -> ((DepsEnv -> DepsEnv) -> InterpretM a -> InterpretM a) -> InterpretM a
--- innerStack vn local_env = local_env $ InnerStackOP vn x
-  
-
 -- Finds the relation between the name and the explicit ExpBase definition i a DecBase
 bindingInDecBase :: DepsEnv -> DecBase Info VName -> BoundDepVal
 bindingInDecBase env (ValDec bind) = -- OBS
@@ -600,17 +605,11 @@ deps env prog =
           deps' (Depends vn' _, db) = 
             case (interpretDepM (env, CallStack [vn']) $ depsDecBase db) of
               (Right d1, d2) -> Right (Depends vn' d1, d2)
-              (Left e, _) -> Left $ "In function: " <> show vn' <> "\n" <> e
-          deps' _ = Left $ "Could not find name of a top level definition"
-            -- Could omit this case since these is already an "error" in the fact that the name could not be found
-            -- case interpretDepM (env, Ids [vn']) . depsDecBase db of
-            --   (Right d1, d2) -> Right (None (Just d1), d2)
-            --   (Left e, _) -> Left e
-    --  where deps' :: (BoundDepVal, (Either Error DepVal, InnerDepVals)) -> Either Error (BoundDepVal, InnerDepVals)
-    --        deps' (Depends vn' _, (Right d2, d3)) = Right (Depends vn' d2, d3)
-    --        deps' (None _, (Right d2, d3)) = Right (None (Just d2), d3)
-    --        deps' (Depends vn' _, (Left e, _)) = Left $ "In function: " <> show vn' <> "\n" <> e
-    --        deps' (None _, (Left e, _)) = Left e
+              (Left e, _) -> Left $ "In function: " <> show vn' <> " " <> e
+          deps' (_, db) = 
+            case (interpretDepM (env, emptyStack) $ depsDecBase db) of
+              (Right d1, d2) -> Right (None (Just d1), d2)
+              (Left e, _) -> Left e
 
 -- | A printer for printing a pretty string
 prettyPrinter :: Either Error (BoundDepVal, InnerDepVals) -> String -> String
