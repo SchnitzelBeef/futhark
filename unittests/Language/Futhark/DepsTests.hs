@@ -108,11 +108,10 @@ tests =
                       \\n       else (b, b) \
                       \\n   in c \
                       \\ndef f1 arg = f2 arg 6"
-          [Right (["f2"],DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
-          ,Right (["f2", "c"], DepGroupT [("0",DepValT ["b"]),("1",DepValT ["a","b"])])
-          ,Right (["f1"],DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])
-          ,Right (["f1", "f2", "c"], DepGroupT [("0",DepValT []),("1",DepValT ["arg"])])],
-          -- OBS, logs c again since it logged when analyzing f1
+          [Right (["f2"], DepGroupT [("0", DepValT ["b"]),("1", DepValT ["a","b"])])
+          ,Right (["f2", "c"], DepGroupT [("0", DepValT ["b"]),("1", DepValT ["a","b"])])
+          ,Right (["f1"], DepGroupT [("0", DepValT []),("1", DepValT ["arg"])])
+          ,Right (["f1", "f2", "c"], DepGroupT [("0", DepValT []),("1", DepValT ["arg"])])],
 
       testCase "Fixed point iteration in loop" $
         unitDepTest "def f (x0 : i32) (x1 : i32) (x2 : i32) (n : i32) = \
@@ -120,8 +119,8 @@ tests =
                      \\n      loop acc = (x0, x1, x2) for i < n do \
                      \\n          (acc.1, acc.2, acc.0) \
                      \\n  in x.0"
-          [Right (["f"],DepValT ["n", "x0", "x1", "x2"])
-          ,Right (["f", "x"],DepGroupT [("0", DepValT ["n", "x0", "x1", "x2"]),
+          [Right (["f"], DepValT ["n", "x0", "x1", "x2"])
+          ,Right (["f", "x"], DepGroupT [("0", DepValT ["n", "x0", "x1", "x2"]),
                                  ("1", DepValT ["n", "x0", "x1", "x2"]),
                                  ("2", DepValT ["n", "x0", "x1", "x2"])])],
                                  
@@ -129,8 +128,8 @@ tests =
         unitDepTest "def f1 (y : i64) (xs : [4]i64) = \
                      \\n  let f2 x = i64.sum (iota (x + y)) \
                      \\n  in map f2 xs"
-          [Right (["f1"],DepValT ["xs","y"])
-          ,Right (["f1", "f2"],DepValT ["+","iota","sum", "x","y"])],
+          [Right (["f1"], DepValT ["xs","y"])
+          ,Right (["f1", "f2"], DepValT ["x","y"])],
           -- Currently i64.sum is not supported (because it is under TypeDec)
           -- which results in a base-case which is simply the free variables of the expression
 
@@ -141,7 +140,7 @@ tests =
                      \\n    if c \
                      \\n        then a_record i \
                      \\n        else {foo = 2, bar = c}"
-          [Right (["a_record"],DepGroupT [("bar",DepValT []),("foo",DepValT ["a"])])
+          [Right (["a_record"], DepGroupT [("bar", DepValT []),("foo", DepValT ["a"])])
           ,Right (["f"], DepGroupT [("bar", DepValT ["c"]), ("foo", DepValT ["c", "i"])])],
 
       testCase "Pattern matching" $
@@ -151,7 +150,7 @@ tests =
                      \\n  case #bool x -> #bool x \
                      \\n  case #tpl (y, z) -> #tpl (y, c + b)"
           [Left "Does not support analysis of TypeDec"
-          ,Right (["f"],DepValT ["a", "b", "c"])],
+          ,Right (["f"], DepValT ["a", "b", "c"])],
 
       -- ========================== ExpBase tests: =============================
 
@@ -184,31 +183,31 @@ tests =
         unitDepTest "def rcrd = {foo = 0, bar = (1, 2)} \
                      \\ndef f (a : i32) (b : i32) (c : i32) = \
                      \\n  rcrd with bar = (a, b) "
-          [Right (["rcrd"],DepGroupT [
-                            ("bar",DepGroupT [
-                                ("0",DepValT []),
-                                ("1",DepValT [])]),
-                            ("foo",DepValT [])])
-          ,Right (["f"],DepGroupT [
-                            ("bar",DepGroupT [
-                                ("0",DepValT ["a"]),
-                                ("1",DepValT ["b"])]),
-                            ("foo",DepValT [])])],
+          [Right (["rcrd"], DepGroupT [
+                            ("bar", DepGroupT [
+                                ("0", DepValT []),
+                                ("1", DepValT [])]),
+                            ("foo", DepValT [])])
+          ,Right (["f"], DepGroupT [
+                            ("bar", DepGroupT [
+                                ("0", DepValT ["a"]),
+                                ("1", DepValT ["b"])]),
+                            ("foo", DepValT [])])],
       
       testCase "RecordUpdate 2" $
         unitDepTest "def rcrd (c : i32) = {foo = c, bar = (1, 2)} \
                      \\ndef f (a : i32) (b : i32) (c : i32) = \
                      \\n  rcrd c with bar = (a, b) "
-          [Right (["rcrd"],DepGroupT [
-                              ("bar",DepGroupT [
-                                  ("0",DepValT []),
-                                  ("1",DepValT [])]),
-                              ("foo",DepValT ["c"])])
-          ,Right (["f"],DepGroupT [
-                              ("bar",DepGroupT [
-                                  ("0",DepValT ["a"]),
-                                  ("1",DepValT ["b"])]),
-                                  ("foo",DepValT ["c"])])],
+          [Right (["rcrd"], DepGroupT [
+                              ("bar", DepGroupT [
+                                  ("0", DepValT []),
+                                  ("1", DepValT [])]),
+                              ("foo", DepValT ["c"])])
+          ,Right (["f"], DepGroupT [
+                              ("bar", DepGroupT [
+                                  ("0", DepValT ["a"]),
+                                  ("1", DepValT ["b"])]),
+                                  ("foo", DepValT ["c"])])],
 
       testCase "OpSections" $
         unitDepTest "def f2 (x : i32) (y : i32) = x + y \
@@ -227,8 +226,8 @@ tests =
           [Left "Does not support analysis of TypeDec"
           ,Right (["f2"], DepGroupT [("x", DepValT["x'","y'"]), ("y", DepValT["y'"])])
           ,Right (["f1"], DepValT ["a", "b"])
-          ,Right (["f1","x"],DepValT ["a", "b"])
-          ,Right (["f1","y"],DepValT ["b"])],
+          ,Right (["f1","x"], DepValT ["a", "b"])
+          ,Right (["f1","y"], DepValT ["b"])],
 
       testCase "RecordFieldImplicit" $
         unitDepTest "type p = {x : i32, y : i32}\
@@ -275,10 +274,56 @@ tests =
           ,Right (["f2","y"], DepValT ["x"])
           ,Right (["f1"], DepValT ["b"])
           ,Right (["f1","a"], DepFunT [(["f1"], DepFunT [] [NameT "b"])] [NameT "x"])
-          ,Right (["f1","f2","y"], DepValT ["b"])]
+          ,Right (["f1","f2","y"], DepValT ["b"])],
           -- A "fun" thing to note here is that f2 does not store "b" in its domain of the environment
           -- but in the previous test (LetPat 2 lambda), "b" is a part of the domain
           -- This is because functions are statically typed
+
+      testCase "LetFun 1" $
+        unitDepTest "def f (a : i32) (b : i32) = \
+                     \\n  let f' x = x + b \
+                     \\n  in f' a"
+          [Right (["f"], DepValT ["a", "b"])
+          ,Right (["f", "f'"], DepValT ["b", "x"])],
+
+      testCase "LetFun 2" $
+        unitDepTest "def f (a : i32) (b : i32) = \
+                     \\n  let f' (x, y) = x + y \
+                     \\n  in f' (a, b)"
+          [Right (["f"], DepValT ["a", "b"])
+          ,Right (["f", "f'"], DepValT ["x", "y"])],
+
+      testCase "If 1 (inject into deps)" $
+        unitDepTest "def f (a : i32) (b : i32) (c : bool) = \
+                     \\n  if c \
+                     \\n  then a   \
+                     \\n  else b "
+          [Right (["f"], DepValT ["a", "b", "c"])],
+
+      testCase "If 2 (inject into tuple)" $
+        unitDepTest "def f (a : i32) (b : i32) (c : bool) = \
+                     \\n  if c \
+                     \\n  then (a, 0)   \
+                     \\n  else (1, b) "
+          [Right (["f"], DepGroupT [("0", DepValT ["a", "c"]), ("1", DepValT ["b", "c"])])],
+
+      testCase "Loop 1 (for) " $
+        unitDepTest "def f (a : i32) (b : i32) (n : i32) = \
+                     \\n  loop x = a for i < n do \
+                     \\n    x + b "
+          [Right (["f"], DepValT ["a", "b", "n"])],
+
+      testCase "Loop 2 (for in) " $
+        unitDepTest "def f (a : i32) (b : i32) (s : i32) = \
+                     \\n  loop x = a for i in s...10 do \
+                     \\n    x + b "
+          [Right (["f"], DepValT ["a", "b", "s"])],
+
+      testCase "Loop 3 (while) " $
+        unitDepTest "def f (a : i32) (b : i32) (s : i32) = \
+                     \\n  loop x = a while x < s do \
+                     \\n    x + b "
+          [Right (["f"], DepValT ["a", "b", "s"])]
 
 
       -- ========================== CaseBase tests: ============================
