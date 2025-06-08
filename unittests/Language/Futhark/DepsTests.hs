@@ -85,9 +85,6 @@ tests =
   testGroup
     "Dependencies"
     [ 
-      -- ======================= Larger algorithms ============================= 
-      -- (Taken from https://futhark-lang.org/examples.html)
-
       -- =============== Odd-balls/edge cases/comprised tests: =================
 
       testCase "Inner empty binding" $
@@ -143,14 +140,36 @@ tests =
           [Right (["a_record"], DepGroupT [("bar", DepValT []),("foo", DepValT ["a"])])
           ,Right (["f"], DepGroupT [("bar", DepValT ["c"]), ("foo", DepValT ["c", "i"])])],
 
-      testCase "Pattern matching" $
-        unitDepTest "type bool_or_tpl = #bool bool | #tpl (i32, i32) \
-                     \\ndef f (a : bool_or_tpl) (b : i32) (c : i32) : bool_or_tpl = \
-                     \\n  match a \
-                     \\n  case #bool x -> #bool x \
-                     \\n  case #tpl (y, z) -> #tpl (y, c + b)"
+      -- Taken from https://futhark-lang.org/examples/binary-search.html
+      testCase "Binary search" $
+        unitDepTest "def binary_search [n] 't (lte: t -> t -> bool) (xs: [n]t) (x: t) : i64 = \
+                     \\n  let (l, _) = \
+                     \\n    loop (l, r) = (0, n-1) while l < r do \
+                     \\n    let t = l + (r - l) / 2 \
+                     \\n    in if x `lte` xs[t] \
+                     \\n      then (l, t) \
+                     \\n      else (t+1, r) \
+                     \\n  in l"
+          [Right (["binary_search"], DepValT ["lte","x","xs"])
+          ,Right (["binary_search","l"], DepValT ["lte","x","xs"])
+          ,Right (["binary_search","t"], DepValT [])],
+          -- It could be argued that t depends on r in the above example 
+
+      -- Taken from https://futhark-lang.org/examples/searching.html
+      testCase "Searching" $
+        unitDepTest "type found 'a = #found a | #not_found \
+                     \\ndef find_elem 'a [n] (p: a -> bool) (as: [n]a) : found a = \
+                     \\n  let tag x = if p x then #found x else #not_found \
+                     \\n  let op x y = \
+                     \\n    match (x,y) \
+                     \\n    case (#found _, _) -> x \
+                     \\n    case (_, #found _) -> y \
+                     \\n    case _             -> x \
+                     \\n  in reduce_comm op #not_found (map tag as)"
           [Left "Does not support analysis of TypeDec"
-          ,Right (["f"], DepValT ["a", "b", "c"])],
+          ,Right (["find_elem"], DepValT ["as","p"])
+          ,Right (["find_elem","op"], DepValT ["x","y"])
+          ,Right (["find_elem","tag"], DepValT ["p","x"])],
 
       -- ========================== ExpBase tests: =============================
 
@@ -175,9 +194,11 @@ tests =
         unitDepTest "def f (a : i32) (b : i32) (c : i32) = [a, 0, b, 1, 24, c]"
           [Right (["f"], DepValT ["a", "b", "c"])],
 
+      -- Below example taken from https://futhark.readthedocs.io/en/latest/language-reference.html#in-place-updates
       testCase "Update" $
-        unitDepTest "def f (a : i64) (b : i64) (c : i64) = [b, 0, a, 1, 24][c:]"
-          [Right (["f"], DepValT ["a", "b", "c"])],
+        unitDepTest "def modify (a: *[]i32) (i: i32) (x: i32): *[]i32 = \
+                     \\n  a with [i] = a[i] + x"
+          [Right (["modify"], DepValT ["a", "i", "x"])],
 
       testCase "RecordUpdate 1" $
         unitDepTest "def rcrd = {foo = 0, bar = (1, 2)} \
@@ -242,8 +263,6 @@ tests =
           ,Right (["f1","y"],DepValT ["b"])],
 
       -- ========================== AppExpBase tests: ==========================
-
-          -- Missing apply (both ways)
 
       testCase "Ranges" $
         unitDepTest "def f (a : i32) (b : i32) (c : i32) = a..b...c"
@@ -323,11 +342,26 @@ tests =
         unitDepTest "def f (a : i32) (b : i32) (s : i32) = \
                      \\n  loop x = a while x < s do \
                      \\n    x + b "
-          [Right (["f"], DepValT ["a", "b", "s"])]
+          [Right (["f"], DepValT ["a", "b", "s"])],
 
+      testCase "LetWith" $
+        unitDepTest "def f (a: *[]i32) (i: i32) (x: i32): *[]i32 = \
+                     \\n  let b = a with [i] = a[i] + x \
+                     \\n  in b "
+          [Right (["f"], DepValT ["a", "i", "x"])
+          ,Right (["f", "b"], DepValT ["a", "i", "x"])],
 
-      -- ========================== CaseBase tests: ============================
+      testCase "Index" $
+        unitDepTest "def f (a : i64) (b : i64) (c : i64) = [b, 0, a, 1, 24][c:]"
+          [Right (["f"], DepValT ["a", "b", "c"])],
 
-      -- ========================== DimIndexBase tests: ========================
+      testCase "Match" $
+        unitDepTest "type int_or_tpl = #int i32 | #tpl (i32, i32) \
+                     \\ndef f (a : i32) (b : i32) (c : bool) : int_or_tpl= \
+                     \\n  match c \
+                     \\n  case true -> #int a \
+                     \\n  case false -> #tpl (a, b) "
+          [Left "Does not support analysis of TypeDec"
+          ,Right (["f"], DepValT ["a", "b", "c"])]
 
     ]
