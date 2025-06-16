@@ -70,9 +70,9 @@ testWithTempFile content correct file h = do
     hPutStr h content
     hClose h
     (_, imports, _) <- readProgramOrDie file
-    -- We only observe the tail of the last output since this corresponds to the
+    -- We only observe the tail of output since this corresponds to the
     -- dependencies of the actual script (without OpenDec)
-    let res = tail $ last $ testDeps $ map (fileProg . snd) imports
+    let res = tail $ testDeps $ map (fileProg . snd) imports
       in correct @=? transformDeps res
 
 -- | Executes a unit test

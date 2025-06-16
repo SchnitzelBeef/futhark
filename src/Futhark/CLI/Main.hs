@@ -90,7 +90,8 @@ commands =
       ("benchcmp", (Benchcmp.main, "Compare two benchmark results.")),
       ("profile", (Profile.main, "Analyse profiling data.")),
       ("fmt", (Fmt.main, "Reformat Futhark source file.")),
-      ("deps", (Deps.main, "Locate instances of irregular parallel data-nesting."))
+      ("deps", (Deps.main, "Find dependencies in functions.")),
+      ("irregular", (Deps.irregular, "Locate instances of irregular parallel data-nesting."))
     ]
 
 msg :: String

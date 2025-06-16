@@ -2,7 +2,7 @@
 
 -- | Finds dependencies between variables in programs
 module Language.Futhark.Deps
-  ( runDeps,
+  ( runInterpreter,
     testDeps,
     DepVal (..),
     BoundDepVal (..),
@@ -11,7 +11,8 @@ module Language.Futhark.Deps
     DepsEnv,
     StackTrace (..),
     Env (..),
-    Ids (..)
+    Ids (..),
+    Config (..)
   )
 where
 
@@ -25,13 +26,45 @@ import Data.List.NonEmpty qualified as NE
 import Data.List
 import Data.Maybe (isJust)
 
+data Config 
+  = DepsConfig
+  | IrregularConfig
+
 type Error = String
 
 newtype Ids = Ids [VName]
   deriving (Eq, Show)
 
+-- | Merges two lists of that have the order instance.
+-- Used when combining two identifier sets which are always ordered
+merge :: Ord a => [a] -> [a] -> [a]
+merge [] [] = []
+merge xs [] = xs
+merge [] ys = ys
+merge (x:xs) (y:ys)
+  | x < y  = x : merge xs (y:ys)
+  | x > y  = y : merge (x:xs) ys
+  | otherwise = x : merge xs ys
+
+instance Semigroup Ids where
+  Ids x <> Ids y = Ids $ merge x y
+
+instance Monoid Ids where
+  mempty = Ids mempty
+
+
 newtype StackTrace = CallStack [VName]
   deriving (Eq, Show, Ord)
+
+newtype Variant = Variant [NestedName]
+  deriving (Eq, Show, Ord)
+
+instance Semigroup Variant where
+  Variant x <> Variant y = Variant $ x ++ y
+
+instance Monoid Variant where
+  mempty = emptyVariance
+
 
 emptyStack :: StackTrace
 emptyStack = CallStack []
@@ -39,12 +72,15 @@ emptyStack = CallStack []
 addToStack :: VName -> StackTrace -> StackTrace
 addToStack vn (CallStack st) = CallStack (st ++ [vn])  
 
+emptyVariance :: Variant
+emptyVariance = Variant []
+
 -- Data type for names in programs
 data NestedName
   = Name VName
   | RecordName (M.Map Name NestedName)
   | WildcardName
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
 -- Core dependence data-type
 data Struct = DepRecord | DepTuple 
@@ -76,8 +112,6 @@ instance Semigroup DepsEnv where
 instance Monoid DepsEnv where
   mempty = Env $ M.empty
 
--- A data-type of a stack-trace and a dependence environment
-
 
 -- Free monad definition
 data Free e a
@@ -98,23 +132,26 @@ instance (Functor e) => Monad (Free e) where
     where
       h x = x >>= f
 
+
 -- The different operations the interpreter can do in a monadic context
 data InterpretOp a
   = LogOp (StackTrace, VName, DepVal) a
-  | EnvOp ((DepsEnv, StackTrace) -> a)  
+  | EnvOp ((DepsEnv, StackTrace, Variant) -> a)  
   | ErrorOp Error
+  | IrregularLog (StackTrace, Variant) a
 
 instance Functor InterpretOp where
   fmap f (LogOp s x) = LogOp s $ f x
   fmap f (EnvOp k) = EnvOp $ f . k
   fmap _ (ErrorOp e) = ErrorOp e
+  fmap f (IrregularLog s x) = IrregularLog s $ f x
 
 -- Interpreter monad
 type InterpretM a = Free InterpretOp a 
 
 
 -- General environment functions
-askEnv :: InterpretM (DepsEnv, StackTrace)
+askEnv :: InterpretM (DepsEnv, StackTrace, Variant)
 askEnv = Free $ EnvOp $ \env -> pure env
 
 modifyEffects :: (Functor e, Functor h)
@@ -125,7 +162,7 @@ modifyEffects :: (Functor e, Functor h)
 modifyEffects _ (Pure x) = Pure x
 modifyEffects g (Free e) = Free $ modifyEffects g <$> g e
 
-localEnv :: ((DepsEnv, StackTrace) -> (DepsEnv, StackTrace))
+localEnv :: ((DepsEnv, StackTrace, Variant) -> (DepsEnv, StackTrace, Variant))
          -> InterpretM a
          -> InterpretM a
 localEnv f = modifyEffects g
@@ -136,15 +173,15 @@ localEnv f = modifyEffects g
 failure :: String -> InterpretM a
 failure = Free . ErrorOp
 
-depsEnvSingle :: Maybe NestedName -> DepVal -> Either Error (DepsEnv, StackTrace)
+depsEnvSingle :: Maybe NestedName -> DepVal -> Either Error (DepsEnv, StackTrace, Variant)
 depsEnvSingle names d = depsEnvExtend names d depsEnvEmpty
 
 depsEnvExtend :: Maybe NestedName
               -> DepVal
-              -> (DepsEnv, StackTrace)
-              -> Either Error (DepsEnv, StackTrace)
-depsEnvExtend (Just (Name vn)) d (Env env, st) =
-  Right $ (Env $ M.insert vn d env, st)
+              -> (DepsEnv, StackTrace, Variant)
+              -> Either Error (DepsEnv, StackTrace, Variant)
+depsEnvExtend (Just (Name vn)) d (Env env, st, v) =
+  Right $ (Env $ M.insert vn d env, st, v)
 depsEnvExtend (Just (RecordName r1)) (DepGroup _ r2) env
   | null r1 && null r2 = Right env
   | otherwise =
@@ -164,23 +201,23 @@ depsEnvExtend Nothing _ env = Right env
 
 depsEnvExtendPure :: VName
                   -> DepVal
-                  -> (DepsEnv, StackTrace) 
-                  -> (DepsEnv, StackTrace)
-depsEnvExtendPure vn d ((Env env, st)) = (Env $ M.insert vn d env, st)
+                  -> (DepsEnv, StackTrace, Variant) 
+                  -> (DepsEnv, StackTrace, Variant)
+depsEnvExtendPure vn d ((Env env, st, v)) = (Env $ M.insert vn d env, st, v)
 
-depsEnvEmpty :: (DepsEnv, StackTrace)
-depsEnvEmpty = (Env M.empty, emptyStack)
+depsEnvEmpty :: (DepsEnv, StackTrace, Variant)
+depsEnvEmpty = (Env M.empty, emptyStack, emptyVariance)
 
-envUnionError :: Either Error (DepsEnv, StackTrace) 
-              -> Either Error (DepsEnv, StackTrace) 
-              -> Either Error (DepsEnv, StackTrace)
+envUnionError :: Either Error (DepsEnv, StackTrace, Variant) 
+              -> Either Error (DepsEnv, StackTrace, Variant) 
+              -> Either Error (DepsEnv, StackTrace, Variant)
 envUnionError (Left e) _ = Left e
 envUnionError  _ (Left e) = Left e
-envUnionError (Right (Env env1, _)) (Right (Env env2, _)) =
-  Right (Env $ env2 <> env1, emptyStack)
+envUnionError (Right (Env env1, _, v1)) (Right (Env env2, _, v2)) =
+  Right (Env $ env2 <> env1, emptyStack, v1 <> v2)
 
-envLookup :: VName -> (DepsEnv, StackTrace) -> InterpretM DepVal
-envLookup vn ((Env env, _)) = do
+envLookup :: VName -> (DepsEnv, StackTrace, Variant) -> InterpretM DepVal
+envLookup vn ((Env env, _, _)) = do
   -- If we know the variable, we return its dependencies. 
   -- Otherwise we return nothing (since it was not found with freeVars)
   -- This can happen in regards to type variables such as i32
@@ -188,7 +225,7 @@ envLookup vn ((Env env, _)) = do
   pure $
     case M.lookup vn env of
       Just x -> x
-      Nothing -> Deps mempty
+      Nothing -> Deps mempty -- Deps $ Ids [vn]
       -- Alternatively: failure $ "Unknown variable: " <> (show vn) 
       -- Or: DepVal $ idsSingle vn
 
@@ -196,22 +233,6 @@ envLookup vn ((Env env, _)) = do
 innerDepsExtend :: (StackTrace, VName, DepVal) -> InnerDepVals -> InnerDepVals
 innerDepsExtend (st, vn, d) (Env env) = Env $ M.insert (addToStack vn st) d env
  
--- | Merges two lists of that have the order instance.
--- Used when combining two identifier sets which are always ordered
-merge :: Ord a => [a] -> [a] -> [a]
-merge [] [] = []
-merge xs [] = xs
-merge [] ys = ys
-merge (x:xs) (y:ys)
-  | x < y  = x : merge xs (y:ys)
-  | x > y  = y : merge (x:xs) ys
-  | otherwise = x : merge xs ys
-
-instance Semigroup Ids where
-  Ids x <> Ids y = Ids $ merge x y
-
-instance Monoid Ids where
-  mempty = Ids mempty
 
 -- A semi-weird semi group. Used when performing union on environments 
 instance Semigroup StackTrace where
@@ -340,9 +361,9 @@ injectNestedNames names dv =
             injectNestedNames' (Deps d') name
 
 -- | Converts nested names to pure DepsEnv's, should be used with care
-nestedNamesToSelfEnv :: NestedName -> (DepsEnv, StackTrace)
+nestedNamesToSelfEnv :: NestedName -> (DepsEnv, StackTrace, Variant)
 nestedNamesToSelfEnv (Name vn) =
-  (Env $ M.singleton vn $ Deps $ idsSingle vn, emptyStack)
+  (Env $ M.singleton vn $ Deps $ idsSingle vn, emptyStack, mempty)
 nestedNamesToSelfEnv (RecordName nv_n) =
   foldMap (nestedNamesToSelfEnv . snd) $ M.toList nv_n
 nestedNamesToSelfEnv WildcardName = mempty
@@ -454,9 +475,9 @@ depsExpBase (IndexSection sb _ _) = do
 depsExpBase (Ascript eb _ _) = depsExpBase eb
 depsExpBase (Coerce eb _ _ _) = depsExpBase eb 
 depsExpBase (Lambda pb_n eb _ _ _) = do
-  env <- askEnv
+  (env, _, _) <- askEnv
   let names = map extractPatBaseName pb_n
-    in pure $ DepFun Nothing (fst env) names eb
+    in pure $ DepFun Nothing env names eb
 depsExpBase (AppExp aeb _) = depsAppExpBase aeb
 
 -- | Finds dependencies in field bases
@@ -466,24 +487,76 @@ depsFieldBase (RecordFieldImplicit (L _ vn) _ _) = do
   env <- askEnv
   envLookup vn env
 
--- | Finds dependencies in application expression bases
-depsAppExpBase :: AppExpBase Info VName -> InterpretM DepVal
-depsAppExpBase (Apply eb lst _) = do
-  d1 <- depsExpBase eb
-  d_n <- mapM depsExpBase $ map snd $ NE.toList lst
-  case d1 of 
-    DepFun maybe_vn env' n_n body -> do
-      env <- askEnv
-      fun_env <-
-        case foldr envUnionError (Right (env', emptyStack)) $
+-- | Evaluates a function where the parameters are pre-evaluated
+-- (Used in Apply-case of depAppExpBase)
+evalFunc :: ExpBase Info VName -> [DepVal] -> InterpretM DepVal 
+evalFunc eb d_n = do
+  d <- depsExpBase eb
+  case d of
+    (DepFun maybe_vn env' n_n body) -> do
+      (_, st, v_n) <- askEnv
+      (fun_env, _, _) <-
+        case foldr envUnionError (Right (env', emptyStack, emptyVariance)) $
               zipWith depsEnvSingle (map Just n_n) d_n of
           Left e -> failure e
           Right e -> pure e 
-      case (maybe_vn, snd env) of
-        (Just vn, st) -> localEnv (const (fst fun_env, addToStack vn st)) $
-                            depsExpBase body
-        (Nothing, _) -> localEnv (const fun_env) $ depsExpBase body
-    d2 -> foldM depValJoin d2 d_n
+      case maybe_vn of
+        (Just vn) ->
+          localEnv (const (fun_env, addToStack vn st, v_n)) $ depsExpBase body
+        Nothing -> localEnv (const (fun_env, st, v_n)) $ depsExpBase body
+    d' -> foldM depValJoin d' d_n
+
+-- | Checks if dependencies of exps are variant to a list of names
+searchDepsForVariables :: [ExpBase Info VName] -> Variant -> Bool
+searchDepsForVariables eb_n (Variant ids) = 
+  foldr (\v res -> res || elem (Name v) ids) False $ freeVarsList $ head eb_n
+
+-- | Evaluates expression with a local environment that is variant to provided argument
+localEnvVariantTo :: [NestedName] -> ExpBase Info VName -> InterpretM DepVal
+localEnvVariantTo n_n body = do
+  (env, st, v) <- askEnv
+  localEnv (const (env, st, v <> Variant n_n)) $ depsExpBase body
+
+-- | Finds dependencies in application expression bases
+depsAppExpBase :: AppExpBase Info VName -> InterpretM DepVal
+depsAppExpBase (Apply eb lst _) =
+  let eb_n = map snd $ NE.toList lst
+    in do
+      d_n <- mapM depsExpBase eb_n
+      -- Experimental support for finding instances of irregular nested data-parallelism
+      -- Only supports map, sum and iota so far!
+      case eb of 
+        (Var (QualName {qualLeaf = vn@(VName "map" _)}) _ _) -> do 
+          (_, st, v_n) <- askEnv 
+          -- Extracting the parameters of the higher order function:
+          case head d_n of
+            (DepFun _ _ n_n body) -> do
+              _ <- localEnvVariantTo n_n body
+              evalFunc eb d_n -- Evaluating rest of parameters
+            _ -> 
+              let v_n' = Variant $ map Name $ freeVarsList $ last eb_n
+                in do
+                  irregularLog (addToStack vn st, v_n <> v_n')
+                  evalFunc eb d_n -- Evaluating rest of parameters
+        -----------------------------------------------------------
+         -- Parallel functions in the set 'P'     
+        (Var (QualName {qualLeaf = vn@(VName "iota" _)}) _ _) -> do
+          (_, st, v_n) <- askEnv 
+          -- Check if the free variables in the parameters (eb_n) are variant
+          -- to the current list of variant parameters
+          if searchDepsForVariables eb_n v_n
+            then irregularLog (addToStack vn st, v_n)
+            else pure ()
+
+          -- Evaluating rest of parameters
+          evalFunc eb d_n
+        (Var (QualName {qualLeaf = vn@(VName "sum" _)}) _ _) -> do
+          (_, st, v_n) <- askEnv 
+          if searchDepsForVariables eb_n v_n
+            then irregularLog (addToStack vn st, v_n)
+            else pure ()
+          evalFunc eb d_n
+        eb' -> evalFunc eb' d_n
 depsAppExpBase (Range eb1 maybe_eb2 inclusive_eb3 _) = do
   d1 <- depsExpBase eb1
   d2 <- maybe (pure $ Deps mempty) depsExpBase maybe_eb2
@@ -496,23 +569,23 @@ depsAppExpBase (Range eb1 maybe_eb2 inclusive_eb3 _) = do
   depValJoin d3 d4
 depsAppExpBase (LetPat _ pb eb1 eb2 _) = do
   d1 <- depsExpBase eb1
-  env <- askEnv
+  (env, st, v) <- askEnv
   let name = extractPatBaseName pb
     in do
-      logDep (snd env) d1 name 
-      env' <- case depsEnvExtend (Just name) d1 env of
+      logDep st d1 name 
+      env' <- case depsEnvExtend (Just name) d1 (env, st, v) of
                 (Left e) -> failure e
                 (Right e) -> pure e
       localEnv (const env') $ depsExpBase eb2
 depsAppExpBase (LetFun vn (_, pb_n, _, _, eb1) eb2 _ ) = do
-  env <- askEnv
+  (env, st, v) <- askEnv
   let names = map extractPatBaseName pb_n
-      fun = DepFun (Just vn) (fst env) names eb1
+      fun = DepFun (Just vn) env names eb1
     in do
       d1 <- depsExpBase eb1
       d2 <- injectNestedNames names d1
-      logDep (snd env) d2 $ Name vn
-      env' <- pure $ depsEnvExtendPure vn fun env
+      logDep st d2 $ Name vn
+      env' <- pure $ depsEnvExtendPure vn fun (env, st, v)
       localEnv (const env') $ depsExpBase eb2
 depsAppExpBase (If eb1 eb2 eb3 _) = do
   d1 <- depsExpBase eb1
@@ -576,11 +649,11 @@ depsAppExpBase (LetWith ib1 ib2 sb eb1 eb2 _) = do
   -- We could log the new array that is created.
   -- It depends on all the values of the first expression base but also
   -- indirectly on all the dependencies of the consumed array
-  env <- askEnv
-  d2 <- envLookup (identName ib2) env
+  (env, st, v) <- askEnv
+  d2 <- envLookup (identName ib2) (env, st, v)
   d3 <- depValJoin d1 d2
-  logDep (snd env) d3 $ Name $ identName ib1
-  env' <- pure $ depsEnvExtendPure (identName ib1) d1 env
+  logDep st d3 $ Name $ identName ib1
+  env' <- pure $ depsEnvExtendPure (identName ib1) d1 (env, st, v)
   d4 <- mapM depValDeps d_n
   res <- localEnv (const env') $ depsExpBase eb2
   depValInj (mergeDepVals d4) res
@@ -614,7 +687,7 @@ depsSliceBase :: SliceBase Info VName -> InterpretM [DepVal]
 depsSliceBase = mapM depsDimIndexBase
 
 -- | Recursive executer of evaluation
-interpretDepM :: (DepsEnv, StackTrace)
+interpretDepM :: (DepsEnv, StackTrace, Variant)
               -> InterpretM DepVal
               -> (Either Error DepVal, InnerDepVals)
 interpretDepM _ (Pure x) = (Right x, Env M.empty)
@@ -622,6 +695,7 @@ interpretDepM env (Free (EnvOp k)) = interpretDepM env $ k env
 interpretDepM env (Free (LogOp d1 x)) =
   let (y, d2) = interpretDepM env x
     in (y, innerDepsExtend d1 d2)
+interpretDepM env (Free (IrregularLog _ x)) = interpretDepM env x
 interpretDepM _ (Free (ErrorOp e)) = (Left e, Env M.empty)
 
 -- | Logs dependencies
@@ -637,6 +711,23 @@ logDep _ _ WildcardName = pure ()
 logDep _ a b = failure $ "Failed to log an inner dependence between " <> 
                             show b <> "\tand\t" <> show a 
 
+-- | IO monad for logging instances of potential irregular data-nesting  
+interpretIrregularM :: (DepsEnv, StackTrace, Variant)
+              -> InterpretM DepVal
+              -> IO ()
+interpretIrregularM _ (Pure _) = pure ()
+interpretIrregularM env (Free (EnvOp k)) = interpretIrregularM env $ k env
+interpretIrregularM env (Free (LogOp _ x)) = interpretIrregularM env x
+interpretIrregularM _ (Free (IrregularLog (st, Variant v) _)) = do
+  putStrLn $ "\ESC[36mPotential for irregular nested data-parallelism:\ESC[0m\n" <> show st <>
+    "\n\tdue to nested data-variance on one of the following parameters: " <> show v <> "\n"
+  -- OBS does not continue evaluation!
+interpretIrregularM _ (Free (ErrorOp e)) = putStrLn e
+
+-- | Logs instances of irregular nested data-parallelism
+irregularLog :: (StackTrace, Variant) -> InterpretM ()
+irregularLog s = Free $ IrregularLog s $ pure ()
+
 -- Finds the relation between the name and the explicit ExpBase in a DecBase
 bindingInDecBase :: DepsEnv -> DecBase Info VName -> BoundDepVal
 bindingInDecBase env (ValDec bind) = -- OBS
@@ -647,59 +738,78 @@ bindingInDecBase env (ValDec bind) = -- OBS
 bindingInDecBase env (LocalDec db _) = bindingInDecBase env db 
 bindingInDecBase _ _ = None Nothing
 
--- | Interpretation function for dependencies
-deps :: DepsEnv -> Prog -> [Either Error (BoundDepVal, InnerDepVals)]
-deps env prog = 
-  -- Finds all the bindings on "program base" level, e.g. the main script level
+-- | Finds all the bindings on "program base" level, e.g. the main script level
+findBindingsInProg :: DepsEnv -> Prog -> [(BoundDepVal, DecBase Info VName)]
+findBindingsInProg env prog =
   let bindings = map (bindingInDecBase env) $ progDecs prog 
-    in map deps' $ zip bindings $ progDecs prog
-    where deps' :: (BoundDepVal, DecBase Info VName) -> Either Error (BoundDepVal, InnerDepVals)
-          deps' (Depends vn' _, db) = 
-            case (interpretDepM (env, CallStack [vn']) $ depsDecBase db) of
-              (Right d1, d2) -> Right (Depends vn' d1, d2)
-              (Left e, _) -> Left $ "In function: " <> show vn' <> " " <> e
-          deps' (_, db) = 
-            case (interpretDepM (env, emptyStack) $ depsDecBase db) of
-              (Right d1, d2) -> Right (None (Just d1), d2)
-              (Left e, _) -> Left e
+    in zip bindings $ progDecs prog
+
+-- Inserts top level functions of the program base into the provided env.  
+joinTopLevelDefs :: Prog -> DepsEnv -> DepsEnv
+joinTopLevelDefs prog env =
+  foldr (\dec env' -> joinTopLevelDefs' (bindingInDecBase env' dec) env') env $
+      progDecs prog  
+    where joinTopLevelDefs' :: BoundDepVal -> DepsEnv -> DepsEnv
+          joinTopLevelDefs' (Depends vn d) env' = 
+            let (env'', _, _ ) = depsEnvExtendPure vn d (env', emptyStack, emptyVariance)
+              in env''
+          joinTopLevelDefs' _ env' = env'
+
+-- | Folds all the dependencies with a given printer over all program bases 
+runDeps :: forall a . (Either Error (BoundDepVal, InnerDepVals) -> a -> a)
+           -> a -> [Prog] -> a
+runDeps printer base progs =
+  let script = last progs 
+      d = deps (joinTopLevelDefs script mempty <> depsFreeVarsInProgBase script) script
+    in foldr printer base d
+    where deps :: DepsEnv -> Prog -> [Either Error (BoundDepVal, InnerDepVals)]
+          deps env prog = map deps' $ findBindingsInProg env prog
+            where deps' :: (BoundDepVal, DecBase Info VName) -> Either Error (BoundDepVal, InnerDepVals)
+                  deps' (Depends vn' _, db) = 
+                    case interpretDepM (env, CallStack [vn'], mempty) $ depsDecBase db of
+                      (Right d1, d2) -> Right (Depends vn' d1, d2)
+                      (Left e, _) -> Left $ "In function: " <> show vn' <> " " <> e
+                  deps' (_, db) = 
+                    case interpretDepM (env, emptyStack, mempty) $ depsDecBase db of
+                      (Right d1, d2) -> Right (None (Just d1), d2)
+                      (Left e, _) -> Left e
+
+-- | Checks the script for potential instances of irregular parallelism
+-- OBS: This feature is by no means complete
+runIrregular :: [Prog] -> IO ()
+runIrregular progs =
+  let script = last progs 
+    in deps (joinTopLevelDefs script mempty <> depsFreeVarsInProgBase script) script
+    where deps :: DepsEnv -> Prog -> IO ()
+          deps env prog = do
+            _ <- mapM deps' $ findBindingsInProg env prog
+            pure ()
+            where deps' :: (BoundDepVal, DecBase Info VName) -> IO ()
+                  deps' (Depends vn' _, db) =
+                    interpretIrregularM (env, CallStack [vn'], mempty) $ depsDecBase db
+                  deps' (_, db) =
+                    interpretIrregularM (env, emptyStack, mempty) $ depsDecBase db
 
 -- | A printer for printing a pretty string
 prettyPrinter :: Either Error (BoundDepVal, InnerDepVals) -> String -> String
-prettyPrinter (Right (bound, Env d_n)) acc =
-  "\n\ESC[0mFunction: \ESC[95m" ++ show bound ++
-  "\n\ESC[0m\tInner dependencies: \ESC[36m" ++ 
-  (foldr (\(k, a) x -> x ++ "\n\t\t" ++ show k ++ " depends on " ++ show a) "" $ M.toList d_n)
-  ++ "\n\ESC[0m" ++ acc 
+prettyPrinter (Right (bound, Env d_n)) acc
+  | M.null d_n = "\n\ESC[0mFunction: \ESC[95m" ++ show bound ++ "\n\ESC[0m" ++ acc 
+  | otherwise = 
+    "\n\ESC[0mFunction: \ESC[95m" ++ show bound ++
+    "\n\ESC[0m\tInner dependencies: \ESC[36m" ++ 
+    (foldr (\(k, a) x -> x ++ "\n\t\t" ++ show k ++ " depends on " ++ show a) "" $ M.toList d_n)
+    ++ "\n\ESC[0m" ++ acc 
 prettyPrinter (Left e) acc =
   "\n\ESC[31mError in dependency interpreter in function: \n\ESC[95m"
   ++ show e ++ "\n\ESC[0m" ++ acc
 
--- Inserts top level functions of the program base into the provided env.  
-joinTopLevelDefs :: DepsEnv -> Prog -> DepsEnv
-joinTopLevelDefs env prog =
-  foldr (\dec env' -> joinTopLevelDefs' (bindingInDecBase env' dec) env') env $
-      progDecs prog  
-    where joinTopLevelDefs' :: BoundDepVal -> DepsEnv -> DepsEnv
-          joinTopLevelDefs' (Depends vn d) env' =
-            fst $ depsEnvExtendPure vn d (env', emptyStack)
-          joinTopLevelDefs' _ env' = env'
-
--- | Folds all the dependencies with a given printer over all program bases 
-depsFolder :: forall a . ([Either Error (BoundDepVal, InnerDepVals)] -> a -> a)
-           -> a -> [Prog] -> a
-depsFolder printer base progs =
-  snd $ foldr depsFolder' (mempty, base) progs
-        where depsFolder' :: Prog -> (DepsEnv, a) -> (DepsEnv, a) 
-              depsFolder' prog (env, s) =
-                let env' = joinTopLevelDefs env prog
-                    either_d = deps (env' <> depsFreeVarsInProgBase prog) prog
-                  -- Extending the top level definitions for functions
-                  in (env', printer either_d s)
+-------
 
 -- | Finds dependencies in a program
-runDeps :: [Prog] -> String
-runDeps progs = depsFolder (\d s -> foldr prettyPrinter s d) "" progs
+runInterpreter :: Config -> [Prog] -> IO ()
+runInterpreter DepsConfig progs = putStrLn $ runDeps prettyPrinter "" progs
+runInterpreter IrregularConfig progs = runIrregular progs
 
 -- | Finds dependencies in a program (outputs more readable data)
-testDeps :: [Prog] -> [[Either Error (BoundDepVal, InnerDepVals)]]
-testDeps progs = depsFolder (\d s -> [d] ++ s) [] progs
+testDeps :: [Prog] -> [Either Error (BoundDepVal, InnerDepVals)]
+testDeps progs = runDeps (:) [] progs
