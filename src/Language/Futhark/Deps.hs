@@ -528,6 +528,10 @@ depsAppExpBase (Apply eb lst _) =
       case eb of 
         (Var (QualName {qualLeaf = vn@(VName "map" _)}) _ _) -> do 
           (_, st, v_n) <- askEnv 
+          -- Check for invariance in "ns"
+          if searchDepsForVariables (tail eb_n) v_n
+            then irregularLog (addToStack vn st, v_n)
+            else pure ()
           -- Extracting the parameters of the higher order function:
           case head d_n of
             (DepFun _ _ n_n body) -> do
