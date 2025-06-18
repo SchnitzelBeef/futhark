@@ -534,7 +534,7 @@ depsAppExpBase (Apply eb lst _) =
               _ <- localEnvVariantTo n_n body
               evalFunc eb d_n -- Evaluating rest of parameters
             _ -> 
-              let v_n' = Variant $ map Name $ freeVarsList $ last eb_n
+              let v_n' = Variant $ map Name $ freeVarsList $ head eb_n
                 in do
                   irregularLog (addToStack vn st, v_n <> v_n')
                   evalFunc eb d_n -- Evaluating rest of parameters
